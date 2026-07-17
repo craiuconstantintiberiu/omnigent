@@ -173,6 +173,7 @@ def _to_conversation(
             else None
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
+        project_id=meta.project_id if meta else None,
     )
 
 
@@ -1338,6 +1339,34 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .values(session_usage=json.dumps(usage))
             )
 
+    def set_conversation_project(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """
+        File a conversation into a first-class project (or unfile it).
+
+        Sets ``omnigent_conversation_metadata.project_id``. ``None`` unfiles the
+        session. This is the first-class replacement for moving a session
+        between ``omni_project`` labels.
+
+        :param conversation_id: The conversation to update, e.g. ``"conv_abc"``.
+        :param project_id: The project id to file under, or ``None`` to unfile.
+        :returns: ``True`` if a metadata row was updated; ``False`` if the
+            conversation has no metadata row.
+        """
+        with self._session() as session:
+            result = session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(project_id=project_id)
+            )
+            return result.rowcount > 0
+
     def increment_session_usage(
         self,
         conversation_id: str,
@@ -2068,6 +2097,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        project_id: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -2289,6 +2319,33 @@ class SqlAlchemyConversationStore(ConversationStore):
                             )
                         )
                     )
+            if project_id is not None:
+                # First-class project membership lives on the metadata row, which
+                # may be in a separate DB from conversations — resolve the member
+                # ids there first, then filter (mirrors the agent_name path).
+                if project_id == "":
+                    filter_ids: list[str] = []  # unfiled
+                    with self._session() as meta_sess:
+                        filter_ids = list(
+                            meta_sess.execute(
+                                select(SqlConversationMetadata.id).where(
+                                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                    SqlConversationMetadata.project_id.is_(None),
+                                )
+                            ).scalars()
+                        )
+                    stmt = stmt.where(SqlConversation.id.in_(filter_ids))
+                else:
+                    with self._session() as meta_sess:
+                        member_ids = list(
+                            meta_sess.execute(
+                                select(SqlConversationMetadata.id).where(
+                                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                    SqlConversationMetadata.project_id == project_id,
+                                )
+                            ).scalars()
+                        )
+                    stmt = stmt.where(SqlConversation.id.in_(member_ids))
             if after:
                 stmt = self._apply_cursor(
                     stmt,

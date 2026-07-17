@@ -286,6 +286,45 @@ def test_set_external_session_id(store: SqlAlchemyConversationStore) -> None:
     assert updated.external_session_id == "ext-uuid-123"
 
 
+# ── project membership ─────────────────────────────────
+
+
+def test_set_conversation_project_lands_in_omnigent_db(
+    omnigent_db: Path, store: SqlAlchemyConversationStore
+) -> None:
+    """``project_id`` is written to the metadata row in the Omnigent DB."""
+    project_id = "b" * 32
+    conv = store.create_conversation(title="filed")
+    assert store.set_conversation_project(conv.id, project_id) is True
+
+    stored = _col(omnigent_db, "omnigent_conversation_metadata", "project_id", f"id=X'{conv.id}'")
+    assert stored == [project_id]
+    # Reads back through the entity (which merges both DBs).
+    assert store.get_conversation(conv.id).project_id == project_id
+
+
+def test_list_conversations_project_id_filter_crosses_dbs(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """The ``project_id`` filter resolves member ids from the metadata DB
+    (Omnigent) and filters conversations in the AP DB — the cross-DB path a
+    single-DB test can't exercise.
+    """
+    project_id = "c" * 32
+    filed = store.create_conversation(title="in-project")
+    unfiled = store.create_conversation(title="loose")
+    store.set_conversation_project(filed.id, project_id)
+
+    members = store.list_conversations(project_id=project_id)
+    assert [c.id for c in members.data] == [filed.id]
+
+    # Empty string means "unfiled" — must include the loose session, exclude the
+    # filed one, even though membership lives in the other physical DB.
+    unfiled_ids = {c.id for c in store.list_conversations(project_id="").data}
+    assert unfiled.id in unfiled_ids
+    assert filed.id not in unfiled_ids
+
+
 # ── conversation items ─────────────────────────────────
 
 

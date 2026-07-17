@@ -58,6 +58,47 @@ def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None
     assert fetched.id == conv.id
 
 
+def test_set_conversation_project_files_and_unfiles(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``set_conversation_project`` sets and clears first-class membership."""
+    project_id = "b" * 32
+    conv = conversation_store.create_conversation()
+    assert conv.project_id is None
+
+    assert conversation_store.set_conversation_project(conv.id, project_id) is True
+    assert conversation_store.get_conversation(conv.id).project_id == project_id
+
+    # Unfile.
+    assert conversation_store.set_conversation_project(conv.id, None) is True
+    assert conversation_store.get_conversation(conv.id).project_id is None
+
+
+def test_set_conversation_project_unknown_session_returns_false(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Filing a non-existent session updates nothing and returns ``False``."""
+    assert conversation_store.set_conversation_project("f" * 32, "b" * 32) is False
+
+
+def test_list_conversations_filters_by_project_id(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``list_conversations(project_id=...)`` returns members; ``""`` unfiled."""
+    project_id = "c" * 32
+    filed = conversation_store.create_conversation(title="filed")
+    unfiled = conversation_store.create_conversation(title="unfiled")
+    conversation_store.set_conversation_project(filed.id, project_id)
+
+    members = conversation_store.list_conversations(project_id=project_id)
+    assert [c.id for c in members.data] == [filed.id]
+
+    unfiled_page = conversation_store.list_conversations(project_id="")
+    unfiled_ids = {c.id for c in unfiled_page.data}
+    assert unfiled.id in unfiled_ids
+    assert filed.id not in unfiled_ids
+
+
 def test_create_with_existing_caller_supplied_id_raises(db_uri: str) -> None:
     """A stable caller id turns a retry from another store into a typed conflict."""
     from omnigent.stores.conversation_store import ConversationAlreadyExistsError

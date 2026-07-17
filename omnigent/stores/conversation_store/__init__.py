@@ -554,6 +554,7 @@ class ConversationStore(ABC):
         owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        project_id: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -650,6 +651,11 @@ class ConversationStore(ABC):
             per-project folder fetch). When set to an empty string
             ``""``, only return sessions with NO project label (unfiled
             sessions). ``None`` disables the filter.
+        :param project_id: First-class project membership filter (the
+            replacement for ``project``). A non-empty id returns only
+            sessions filed under that project (``metadata.project_id``);
+            ``""`` returns only unfiled sessions; ``None`` disables the
+            filter. See ``designs/PROJECTS_PRD.md``.
         :param title: When set, only return conversations whose
             ``title`` matches exactly. ``None`` disables the filter.
             Powers the ``(agent, title)`` child-session lookup in
@@ -882,6 +888,26 @@ class ConversationStore(ABC):
             ``{"input_tokens": 1500, "output_tokens": 350,
             "total_tokens": 1850}``. May carry a nested ``"by_model"``
             sub-dict (per-model token/cost buckets), hence ``Any``.
+        """
+        ...
+
+    @abstractmethod
+    def set_conversation_project(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """
+        File a conversation into a first-class project (or unfile it).
+
+        Sets ``omnigent_conversation_metadata.project_id``; ``None`` unfiles the
+        session. The first-class replacement for moving a session between
+        ``omni_project`` labels (see ``designs/PROJECTS_PRD.md``).
+
+        :param conversation_id: The conversation to update, e.g. ``"conv_abc"``.
+        :param project_id: The project id to file under, or ``None`` to unfile.
+        :returns: ``True`` if a metadata row was updated; ``False`` if the
+            conversation has no metadata row.
         """
         ...
 
