@@ -486,6 +486,12 @@ Tracks what has actually landed vs. what remains. Updated as work ships.
 - ⬜ **Web UI** — always-visible Projects sidebar section; create empty project;
   "New session here"; session-row kebab move; rename (§5–§7). No TS client
   types regenerated yet.
+- ⬜ **Benchmark (when the UI ships).** Once the project sidebar is wired, add a
+  `list_project_sessions` journey to `dev/benchmarks/omnigent` (mirrors the
+  existing `list_sessions` hot read path), and consider a `list_projects`
+  journey. CRUD writes (create/rename/delete) are infrequent single-row ops and
+  don't need a benchmark. Nothing to add now — the routes aren't client-facing
+  yet, so there's no user journey to protect.
 - ⬜ **Phase 2 — project defaults (P4a)** — add a `config` JSON column (small
   add-column migration) and plumb it through the store/entity/API; seed
   host/workspace/harness/model into the new-chat dialog (§8.1).

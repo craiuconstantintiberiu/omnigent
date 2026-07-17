@@ -61,13 +61,16 @@ def upgrade() -> None:
         ["workspace_id", "owner_user_id", "id"],
         unique=False,
     )
-    # Not unique: NULL owners (single-user mode) would otherwise collide on
-    # name; per-owner name uniqueness is enforced in the store.
+    # UNIQUE on (workspace_id, owner_user_id, name): enforces per-owner name
+    # uniqueness at the DB layer for non-NULL owners, closing the store's
+    # check-then-insert race. SQL treats NULLs as distinct, so single-user rows
+    # (owner_user_id IS NULL) can still share a name — the store's _name_taken
+    # check covers that case. Also backs the get-by-name lookup.
     op.create_index(
         "ix_projects_name",
         "projects",
-        ["workspace_id", "owner_user_id", "name", "id"],
-        unique=False,
+        ["workspace_id", "owner_user_id", "name"],
+        unique=True,
     )
 
     with op.batch_alter_table("omnigent_conversation_metadata") as batch_op:

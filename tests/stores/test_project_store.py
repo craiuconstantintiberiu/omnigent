@@ -126,8 +126,10 @@ def test_named_owner_cannot_get_none_owner_project(store: SqlAlchemyProjectStore
 def test_named_owner_cannot_mutate_none_owner_project(store: SqlAlchemyProjectStore) -> None:
     """update / delete on a ``None``-owner project are no-ops for a named user."""
     store.create(_uid("solo"), "Solo", None)
-    assert store.update(_uid("solo"), owner_user_id="alice@example.com", name="Hacked") is None
-    assert store.delete(_uid("solo"), owner_user_id="alice@example.com") is False
+    updated = store.update(_uid("solo"), owner_user_id="alice@example.com", name="Hacked")
+    assert updated is None
+    deleted = store.delete(_uid("solo"), owner_user_id="alice@example.com")
+    assert deleted is False
     # Untouched for the real (None) owner.
     assert store.get(_uid("solo"), owner_user_id=None).name == "Solo"
 
@@ -153,12 +155,29 @@ def test_same_name_allowed_across_owners(store: SqlAlchemyProjectStore) -> None:
 def test_duplicate_name_rejected_for_null_owner(store: SqlAlchemyProjectStore) -> None:
     """Single-user mode (NULL owner) still enforces name uniqueness.
 
-    A DB unique index cannot do this (SQL treats NULLs as distinct), so the
-    store guards it explicitly.
+    The DB UNIQUE index can't do this (SQL treats NULLs as distinct), so the
+    store's ``_name_taken`` check is the sole guard for NULL owners.
     """
     store.create(_uid("p1"), "Solo", None)
     with pytest.raises(OmnigentError) as exc:
         store.create(_uid("p2"), "Solo", None)
+    assert exc.value.code == ErrorCode.ALREADY_EXISTS
+
+
+def test_duplicate_name_rejected_at_db_layer_for_named_owner(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    """The UNIQUE index enforces per-owner uniqueness even if the store's
+    ``_name_taken`` pre-check is bypassed — the DB is the race backstop.
+
+    Monkeypatching ``_name_taken`` to always-miss simulates two concurrent
+    creates both passing the check; the second must still fail via the index's
+    ``IntegrityError``, mapped to ``ALREADY_EXISTS``.
+    """
+    store.create(_uid("p1"), "Dup", "alice@example.com")
+    store._name_taken = lambda *a, **k: False  # type: ignore[method-assign]
+    with pytest.raises(OmnigentError) as exc:
+        store.create(_uid("p2"), "Dup", "alice@example.com")
     assert exc.value.code == ErrorCode.ALREADY_EXISTS
 
 
@@ -184,13 +203,15 @@ def test_update_noop_leaves_updated_at_none(store: SqlAlchemyProjectStore) -> No
 
 def test_update_missing_returns_none(store: SqlAlchemyProjectStore) -> None:
     """Updating an unknown project returns ``None``."""
-    assert store.update(_uid("nope"), owner_user_id="alice@example.com", name="X") is None
+    updated = store.update(_uid("nope"), owner_user_id="alice@example.com", name="X")
+    assert updated is None
 
 
 def test_update_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     """A non-owner cannot rename another user's project."""
     store.create(_uid("p1"), "Alice Project", "alice@example.com")
-    assert store.update(_uid("p1"), owner_user_id="bob@example.com", name="Hacked") is None
+    updated = store.update(_uid("p1"), owner_user_id="bob@example.com", name="Hacked")
+    assert updated is None
     # Unchanged for the real owner.
     assert store.get(_uid("p1"), owner_user_id="alice@example.com").name == "Alice Project"
 
@@ -210,13 +231,16 @@ def test_update_rejects_duplicate_name(store: SqlAlchemyProjectStore) -> None:
 def test_delete_removes_project(store: SqlAlchemyProjectStore) -> None:
     """``delete`` removes the project and is idempotent."""
     store.create(_uid("p1"), "Doomed", "alice@example.com")
-    assert store.delete(_uid("p1"), owner_user_id="alice@example.com") is True
+    deleted = store.delete(_uid("p1"), owner_user_id="alice@example.com")
+    assert deleted is True
     assert store.get(_uid("p1"), owner_user_id="alice@example.com") is None
-    assert store.delete(_uid("p1"), owner_user_id="alice@example.com") is False
+    deleted_again = store.delete(_uid("p1"), owner_user_id="alice@example.com")
+    assert deleted_again is False
 
 
 def test_delete_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     """A non-owner cannot delete another user's project."""
     store.create(_uid("p1"), "Alice Project", "alice@example.com")
-    assert store.delete(_uid("p1"), owner_user_id="bob@example.com") is False
+    deleted = store.delete(_uid("p1"), owner_user_id="bob@example.com")
+    assert deleted is False
     assert store.get(_uid("p1"), owner_user_id="alice@example.com") is not None

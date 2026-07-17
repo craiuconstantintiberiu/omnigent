@@ -616,10 +616,18 @@ class SqlProject(OmnigentBase):
         # Server returns a stable order (created_at / name); reorder, if ever
         # added, is a client-only concern, so there is no ``position`` column.
         Index("ix_projects_owner_user_id", "workspace_id", "owner_user_id", "id"),
-        # Backs the per-owner name-uniqueness check and get-by-name lookup the
-        # store does. Not a unique index: NULL owners (single-user mode) would
-        # otherwise all collide on name; the store enforces uniqueness instead.
-        Index("ix_projects_name", "workspace_id", "owner_user_id", "name", "id"),
+        # Enforces per-owner name uniqueness at the DB layer for NON-NULL owners
+        # (closing the store's check-then-insert race under concurrency). SQL
+        # treats NULLs as distinct, so single-user rows (owner_user_id IS NULL)
+        # can still collide on name — the store's _name_taken check covers that
+        # case. Also backs the get-by-name lookup.
+        Index(
+            "ix_projects_name",
+            "workspace_id",
+            "owner_user_id",
+            "name",
+            unique=True,
+        ),
     )
 
 

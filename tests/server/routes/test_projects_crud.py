@@ -120,7 +120,8 @@ async def test_get_project(project_client: httpx.AsyncClient) -> None:
     assert resp.status_code == 200
     assert resp.json()["name"] == "X"
 
-    assert (await project_client.get(f"/v1/projects/{'0' * 32}")).status_code == 404
+    missing = await project_client.get(f"/v1/projects/{'0' * 32}")
+    assert missing.status_code == 404
 
 
 async def test_rename_project(project_client: httpx.AsyncClient) -> None:
@@ -146,7 +147,8 @@ async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
 
-    assert (await project_client.delete(f"/v1/projects/{created['id']}")).status_code == 404
+    second_delete = await project_client.delete(f"/v1/projects/{created['id']}")
+    assert second_delete.status_code == 404
 
 
 # ── Multi-user: projects are owner-private ─────────────────────────────

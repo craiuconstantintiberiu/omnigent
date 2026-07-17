@@ -295,7 +295,8 @@ def test_set_conversation_project_lands_in_omnigent_db(
     """``project_id`` is written to the metadata row in the Omnigent DB."""
     project_id = "b" * 32
     conv = store.create_conversation(title="filed")
-    assert store.set_conversation_project(conv.id, project_id) is True
+    filed = store.set_conversation_project(conv.id, project_id)
+    assert filed is True
 
     stored = _col(omnigent_db, "omnigent_conversation_metadata", "project_id", f"id=X'{conv.id}'")
     assert stored == [project_id]

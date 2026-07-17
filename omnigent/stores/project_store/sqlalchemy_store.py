@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from sqlalchemy import asc, select
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.db_models import SqlProject, current_workspace_id
 from omnigent.db.utils import (
@@ -89,7 +90,15 @@ class SqlAlchemyProjectStore(ProjectStore):
         name: str,
         owner_user_id: str | None,
     ) -> Project:
-        """Insert a new, empty project."""
+        """Insert a new, empty project.
+
+        Name uniqueness has two layers: the ``_name_taken`` pre-check gives a
+        friendly error (and is the only guard for NULL owners, which SQL treats
+        as distinct), while the ``ix_projects_name`` UNIQUE index enforces it at
+        the DB layer for non-NULL owners — catching a concurrent create that
+        slips past the check. An index violation surfaces as ``IntegrityError``,
+        which we map to the same ``ALREADY_EXISTS``.
+        """
         with self._session() as session:
             if self._name_taken(session, owner_user_id=owner_user_id, name=name, exclude_id=None):
                 raise OmnigentError(
@@ -104,7 +113,13 @@ class SqlAlchemyProjectStore(ProjectStore):
                 updated_at=None,
             )
             session.add(row)
-            session.flush()
+            try:
+                session.flush()
+            except IntegrityError as exc:
+                raise OmnigentError(
+                    f"A project named {name!r} already exists",
+                    code=ErrorCode.ALREADY_EXISTS,
+                ) from exc
             return _to_entity(row)
 
     def get(self, project_id: str, *, owner_user_id: str | None) -> Project | None:
@@ -156,7 +171,15 @@ class SqlAlchemyProjectStore(ProjectStore):
                 changed = True
             if changed:
                 row.updated_at = now_epoch()
-            session.flush()
+            try:
+                session.flush()
+            except IntegrityError as exc:
+                # A concurrent rename raced past _name_taken and hit the UNIQUE
+                # index (non-NULL owners).
+                raise OmnigentError(
+                    f"A project named {name!r} already exists",
+                    code=ErrorCode.ALREADY_EXISTS,
+                ) from exc
             return _to_entity(row)
 
     def delete(self, project_id: str, *, owner_user_id: str | None) -> bool:
