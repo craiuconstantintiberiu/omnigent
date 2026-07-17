@@ -377,13 +377,20 @@ async def _refresh_claude_permission_hook_auth(
     bridge_dir: Path,
     server_url: str,
     auth_token_factory: Callable[[], str | None],
+    refresh_interval_s: float = _PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S,
 ) -> None:
-    """Keep the Claude permission hook's bearer snapshot current."""
+    """Keep the Claude permission hook's bearer snapshot current.
+
+    :param bridge_dir: Owner-only Claude bridge directory.
+    :param server_url: Omnigent server receiving permission requests.
+    :param auth_token_factory: Refresh-capable runner bearer factory.
+    :param refresh_interval_s: Delay between snapshot refresh attempts.
+    """
     from omnigent.claude_native_bridge import update_permission_hook_auth_headers
     from omnigent.cli_auth import databricks_request_headers
 
     while True:
-        await asyncio.sleep(_PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S)
+        await asyncio.sleep(refresh_interval_s)
         try:
             token = await asyncio.to_thread(auth_token_factory)
             if token:
@@ -392,11 +399,7 @@ async def _refresh_claude_permission_hook_auth(
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — retain the last still-valid snapshot
-            _logger.warning(
-                "Could not refresh Claude permission-hook auth for %s",
-                bridge_dir,
-                exc_info=True,
-            )
+            _logger.warning("Could not refresh Claude permission-hook auth")
 
 
 # Background tasks that re-pop a still-pending cost-budget approval on a
@@ -5980,8 +5983,7 @@ async def _auto_create_claude_terminal(
         finally:
             if refresh_task is not None:
                 refresh_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await refresh_task
+                _ = await asyncio.gather(refresh_task, return_exceptions=True)
 
     _forwarder_task = asyncio.create_task(
         _supervise_bridge(),

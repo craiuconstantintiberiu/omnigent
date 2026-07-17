@@ -68,6 +68,7 @@ from omnigent.runner.app import (
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
+    _refresh_claude_permission_hook_auth,
     _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
     _terminal_lookup_miss_log_state,
@@ -14283,15 +14284,8 @@ async def test_claude_permission_hook_snapshot_refreshes_without_binding_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The parent runner refreshes delegated hook auth in the bridge file."""
-    import omnigent.runner.app as runner_app_mod
-
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(
-        runner_app_mod,
-        "_PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S",
-        0.01,
-    )
     bridge_dir = prepare_bridge_dir("refresh-hook-auth", workspace=tmp_path)
     claude_native_bridge.build_hook_settings(
         bridge_dir,
@@ -14300,10 +14294,11 @@ async def test_claude_permission_hook_snapshot_refreshes_without_binding_token(
     )
 
     task = asyncio.create_task(
-        runner_app_mod._refresh_claude_permission_hook_auth(
+        _refresh_claude_permission_hook_auth(
             bridge_dir=bridge_dir,
             server_url="https://omnigent.example.com",
             auth_token_factory=lambda: "fresh-delegated-token",
+            refresh_interval_s=0.01,
         )
     )
     try:
@@ -14320,8 +14315,7 @@ async def test_claude_permission_hook_snapshot_refreshes_without_binding_token(
         await asyncio.wait_for(_wait_for_refresh(), timeout=1.0)
     finally:
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        _ = await asyncio.gather(task, return_exceptions=True)
 
     config = read_permission_hook_config(bridge_dir)
     assert config["ap_auth_headers"]["Authorization"] == "Bearer fresh-delegated-token"
