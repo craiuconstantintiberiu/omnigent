@@ -109,6 +109,7 @@ _DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 # Symlinks (not copies) so credential refreshes in the real home propagate
 # to running sessions without any action from Omnigent.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
+_CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md")
 
 # Files copied (not symlinked) from the real CODEX_HOME into the per-session
 # temp home. config.toml is intentionally copied so that an in-TUI ``/model``
@@ -713,7 +714,7 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     if not source_dir.is_dir():
         return
 
-    for filename in _CODEX_HOME_SYMLINK_FILES:
+    for filename in (*_CODEX_HOME_SYMLINK_FILES, *_CODEX_HOME_GLOBAL_INSTRUCTION_FILES):
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
