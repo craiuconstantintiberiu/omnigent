@@ -252,6 +252,52 @@ def test_make_auth_token_factory_prefers_host_delegation_over_user_credentials(
     assert resolve_calls == []
 
 
+def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Apps OAuth redirect makes delegation fall back to refreshable auth."""
+    mint_calls: list[int] = []
+
+    class _SdkAuth:
+        """Refreshable Databricks auth stand-in."""
+
+        def current_token(self) -> str:
+            return "workspace-token"
+
+    def _apps_redirect(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+        """Model the Apps edge intercepting the mint request before Omnigent."""
+        del server_url, binding_token
+        mint_calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        response = httpx.Response(
+            302,
+            headers={
+                "Location": (
+                    "https://workspace.cloud.databricks.com/oidc/oauth2/v2.0/authorize"
+                    "?redirect_uri=https%3A%2F%2Fapp.databricksapps.com%2F.auth%2Fcallback"
+                )
+            },
+            request=request,
+        )
+        raise httpx.HTTPStatusError("redirected to login", request=request, response=response)
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda *args, **kwargs: (_SdkAuth(), "https://workspace.cloud.databricks.com"),
+    )
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _apps_redirect)
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "workspace-token"
+    assert mint_calls == [1]
+
+
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

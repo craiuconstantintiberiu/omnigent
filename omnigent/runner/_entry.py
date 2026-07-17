@@ -459,14 +459,15 @@ def _make_managed_mint_factory(
         only credential), presented to the mint endpoint.
     :returns: A sync callable returning a fresh owner JWT, or ``None`` only
         when the server *definitively* will not mint for this runner (HTTP
-        400 no-auth/header mode, or 404 older server without the endpoint) —
-        the runner then sends unauthenticated requests, as it did before this
-        fallback existed. A *transient* probe failure still installs the
-        factory, which re-mints on the next callback (so a blip at boot does
-        not leave the runner unauthenticated until process restart). If such
-        a post-install mint then gets the definitive 400/404, the factory
-        latches ``declined`` and returns ``None`` thereafter, and
-        :class:`_RunnerDatabricksAuth` falls back to bare requests.
+        400 no-auth/header mode, 404 older server without the endpoint, or a
+        Databricks Apps OAuth redirect before the request reaches the app) —
+        the runner then uses the legacy credential path. A *transient* probe
+        failure still installs the factory, which re-mints on the next
+        callback (so a blip at boot does not leave the runner unauthenticated
+        until process restart). If such a post-install mint then gets a
+        definitive refusal, the factory latches ``declined`` and returns
+        ``None`` thereafter, and :class:`_RunnerDatabricksAuth` falls back to
+        bare requests.
     """
     from omnigent.runner.identity import token_bound_runner_id
 
@@ -475,12 +476,12 @@ def _make_managed_mint_factory(
 
     # Construction probe. Decline to install the factory ONLY when the
     # server definitively will not mint for this runner — HTTP 400 (no auth
-    # provider / header mode) or 404 (an older server without the endpoint).
-    # There the runner falls back to bare requests, which are correct on a
-    # no-auth server. Every other outcome installs the factory: a success
-    # seeds the cache; a transient failure (network blip, 5xx, timeout)
-    # installs it anyway so the next callback re-mints, rather than leaving
-    # the runner unauthenticated until process restart.
+    # provider / header mode), 404 (an older server without the endpoint), or
+    # an Apps OAuth redirect that happens before the request reaches Omnigent.
+    # Every other outcome installs the factory: a success seeds the cache; a
+    # transient failure (network blip, 5xx, timeout) installs it anyway so the
+    # next callback re-mints, rather than leaving the runner unauthenticated
+    # until process restart.
     factory = _ManagedMintTokenFactory(mint_url, server_url, binding_token)
     factory()
     if factory.declined:
@@ -493,7 +494,8 @@ class _ManagedMintTokenFactory:
 
     Each call returns the cached JWT until it nears expiry, then re-mints
     via :func:`_mint_managed_owner_token`. When a mint gets a *definitive*
-    refusal (HTTP 400 no-auth/header mode, 404 older server), the
+    refusal (HTTP 400 no-auth/header mode, 404 older server, or an Apps OAuth
+    redirect), the
     :attr:`declined` latch is set and every subsequent call returns
     ``None`` without touching the network —
     :meth:`_RunnerDatabricksAuth.auth_flow` reads the latch to send bare
@@ -535,7 +537,10 @@ class _ManagedMintTokenFactory:
                 self._mint_url, self._server_url, self._binding_token
             )
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in (400, 404):
+            response = exc.response
+            if response.status_code in (400, 404) or (
+                response.is_redirect and _is_login_redirect_or_unauthorized(response)
+            ):
                 self.declined = True
                 return None
             return self._still_valid_cached_token(now)
