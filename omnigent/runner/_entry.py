@@ -247,6 +247,7 @@ class _RunnerDatabricksAuth(httpx.Auth):
         if self._factory is None:
             return
         if _is_login_redirect_or_unauthorized(response):
+            _invalidate_auth_token_factory(self._factory)
             token = self._factory()
             if token:
                 request.headers["Authorization"] = f"Bearer {token}"
@@ -285,17 +286,79 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     return "/oidc/" in location or "/.auth/" in location
 
 
+def _invalidate_auth_token_factory(factory: Callable[[], str | None]) -> bool:
+    """Invalidate a bootstrap token factory when it supports that operation.
+
+    Ordinary token factories already return a fresh token on each call and
+    expose no invalidation hook. A host-bootstrap factory holds its initial
+    bearer until the server rejects it; invalidating switches the factory to
+    the runner's existing refreshable credential path.
+
+    :param factory: Runner auth token factory.
+    :returns: ``True`` when a bootstrap token was invalidated.
+    """
+    invalidate = getattr(factory, "invalidate", None)
+    if not callable(invalidate):
+        return False
+    return bool(invalidate())
+
+
+class _InitialAuthTokenFactory:
+    """Use a host bearer until rejection, then lazily resolve runner auth."""
+
+    def __init__(self, token: str, server_url: str) -> None:
+        """
+        :param token: Current bearer obtained from the connected host.
+        :param server_url: Omnigent server URL used by the fallback resolver.
+        """
+        self._initial_token: str | None = token
+        self._server_url = server_url
+        self._fallback_factory: Callable[[], str | None] | None = None
+        self._fallback_resolved = False
+        self._lock = threading.Lock()
+
+    def __call__(self) -> str | None:
+        """Return the host bearer or a token from the lazy local fallback."""
+        with self._lock:
+            if self._initial_token is not None:
+                return self._initial_token
+            if not self._fallback_resolved:
+                self._fallback_factory = _make_auth_token_factory(
+                    self._server_url,
+                    _allow_initial_token=False,
+                    _allow_delegated_mint=False,
+                )
+                self._fallback_resolved = True
+            if self._fallback_factory is None:
+                return None
+            return self._fallback_factory()
+
+    def invalidate(self) -> bool:
+        """Discard the host bearer so the next call resolves local auth."""
+        with self._lock:
+            if self._initial_token is None:
+                return False
+            self._initial_token = None
+            _logger.info("host bootstrap bearer rejected; resolving runner-local auth")
+            return True
+
+
 def _make_auth_token_factory(
     server_url: str | None = None,
+    *,
+    _allow_initial_token: bool = True,
+    _allow_delegated_mint: bool = True,
 ) -> Callable[[], str | None] | None:
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
-      1. Host-delegated runner token, when the host launch marker and
+      1. Host's current bearer, when injected for runner bootstrap. This is
+         used until rejection; local refreshable auth resolves lazily.
+      2. Host-delegated runner token, when the host launch marker and
          binding token are present.
-      2. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
+      3. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
          (populated by ``omnigent login``), keyed by ``server_url``.
-      3. Databricks OAuth token (refreshed via the SDK) — host-keyed
+      4. Databricks OAuth token (refreshed via the SDK) — host-keyed
          when a Databricks Apps pointer record is stored for
          ``server_url`` (``omnigent login <apps-url>``), ambient
          otherwise.
@@ -320,24 +383,37 @@ def _make_auth_token_factory(
     :returns: A sync callable returning a bearer token string, or
         ``None`` when no refresh mechanism is available.
     """
+    resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
+
+    # Consume the host bearer before any credential discovery. Removing it
+    # from os.environ here ensures later harness/terminal children cannot
+    # inherit it even if a spawn path bypasses the standard secret scrubber.
+    from omnigent.runner.identity import (
+        RUNNER_DELEGATED_AUTH_ENV_VAR,
+        RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+    )
+
+    initial_token = (
+        os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "").strip()
+        if _allow_initial_token
+        else ""
+    )
+    if initial_token and resolved_server_url:
+        _logger.info("using host-provided bearer for runner bootstrap")
+        return _InitialAuthTokenFactory(initial_token, resolved_server_url)
+
     from omnigent.inner.databricks_executor import (
         DatabricksAuthError,
         _DatabricksBearerAuth,
         _resolve_databricks_auth,
     )
 
-    resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
-
     # Prefer the host-launched runner's owner-bound capability so user
     # credentials stay out of the runner and credential discovery is skipped.
-    from omnigent.runner.identity import (
-        RUNNER_DELEGATED_AUTH_ENV_VAR,
-        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
-    )
-
     delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
     binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
-    if delegated_auth and resolved_server_url and binding_token:
+    if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
         delegated_factory = _make_managed_mint_factory(resolved_server_url, binding_token)
         if delegated_factory is not None:
             return delegated_factory
@@ -425,7 +501,7 @@ def _make_auth_token_factory(
     # tunnel bearer) with a short-lived owner JWT the server mints against
     # that binding token — refreshed on demand, so there is no static
     # credential at rest and no fixed session-length cap.
-    if resolved_server_url:
+    if _allow_delegated_mint and resolved_server_url:
         try:
             binding_token = _runner_tunnel_binding_token_from_env()
         except RuntimeError:

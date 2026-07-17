@@ -17,6 +17,7 @@ import pytest
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _agent_cache_dest,
+    _InitialAuthTokenFactory,
     _load_runner_idle_timeout_s_from_config,
     _make_auth_token_factory,
     _make_managed_mint_factory,
@@ -33,7 +34,10 @@ from omnigent.runner._entry import (
     _server_url_from_env,
     main,
 )
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+from omnigent.runner.identity import (
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+)
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 
 # Force-load the MCP streamable-http client before any test monkeypatches
@@ -250,6 +254,58 @@ def test_make_auth_token_factory_prefers_host_delegation_over_user_credentials(
     assert factory is not None
     assert factory() == "delegated-jwt"
     assert resolve_calls == []
+
+
+def test_initial_host_token_defers_local_auth_until_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host bearer covers startup and resolves runner auth only on rejection."""
+    resolve_calls: list[int] = []
+    mint_calls: list[int] = []
+
+    class _SdkAuth:
+        """Refreshable runner-local auth stand-in."""
+
+        def current_token(self) -> str:
+            return "runner-refreshed-token"
+
+    def _resolve(*args: Any, **kwargs: Any) -> tuple[_SdkAuth, str]:
+        del args, kwargs
+        resolve_calls.append(1)
+        return _SdkAuth(), "https://workspace.cloud.databricks.com"
+
+    def _unexpected_mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        del args, kwargs
+        mint_calls.append(1)
+        raise AssertionError("bootstrap fallback must use runner-local refresh auth")
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _unexpected_mint)
+
+    factory = _make_auth_token_factory()
+
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    assert RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR not in os.environ
+    assert factory() == "host-bootstrap-token"
+    assert factory() == "host-bootstrap-token"
+    assert resolve_calls == []
+    assert mint_calls == []
+
+    request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
+    redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
+    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, redirect)
+
+    assert captured == [
+        "Bearer host-bootstrap-token",
+        "Bearer runner-refreshed-token",
+    ]
+    assert resolve_calls == [1]
+    assert mint_calls == []
 
 
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(

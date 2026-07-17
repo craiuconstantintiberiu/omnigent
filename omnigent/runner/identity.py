@@ -19,6 +19,9 @@ RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
+# A host-launched runner uses this bearer for its initial server connection,
+# then falls back to its own refreshable auth when the bearer is rejected.
+RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN"
 # Host-launched runners use their binding token to obtain a short-lived,
 # owner-scoped server bearer instead of resolving the host user's credentials.
 RUNNER_DELEGATED_AUTH_ENV_VAR = "OMNIGENT_RUNNER_DELEGATED_AUTH"
@@ -55,7 +58,12 @@ OMNIGENT_SESSION_ENV_VALUE = "1"
 # spawned child: the agent payload there could use it to impersonate the
 # runner. Stripped at every runner→child spawn boundary via
 # :func:`strip_runner_auth_secrets`.
-RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset({RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR})
+RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset(
+    {
+        RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+    }
+)
 
 
 def strip_runner_auth_secrets(env: Mapping[str, str]) -> dict[str, str]:
