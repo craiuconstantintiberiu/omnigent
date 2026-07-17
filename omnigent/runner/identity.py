@@ -19,6 +19,9 @@ RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
+# Host-launched runners use their binding token to obtain a short-lived,
+# owner-scoped server bearer instead of resolving the host user's credentials.
+RUNNER_DELEGATED_AUTH_ENV_VAR = "OMNIGENT_RUNNER_DELEGATED_AUTH"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,

@@ -222,6 +222,36 @@ def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
     assert factory() == "managed-jwt"
 
 
+def test_make_auth_token_factory_prefers_host_delegation_over_user_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host-launched runners mint a scoped bearer without resolving user auth."""
+    resolve_calls: list[int] = []
+
+    def _unexpected_sdk_auth(*args: Any, **kwargs: Any) -> tuple[Any, str]:
+        del args, kwargs
+        resolve_calls.append(1)
+        raise AssertionError("delegated runners must not resolve host Databricks auth")
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        _unexpected_sdk_auth,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner._entry._mint_managed_owner_token",
+        lambda mint_url, server_url, binding_token: ("delegated-jwt", time.time() + 1800),
+    )
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "delegated-jwt"
+    assert resolve_calls == []
+
+
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

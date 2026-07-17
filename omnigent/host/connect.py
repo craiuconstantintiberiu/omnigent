@@ -73,6 +73,7 @@ from omnigent.process_logging import (
     process_log_dir,
 )
 from omnigent.runner.identity import (
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -549,6 +550,7 @@ def _build_runner_env(
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
+    env[RUNNER_DELEGATED_AUTH_ENV_VAR] = "1"
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
     return env

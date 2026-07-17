@@ -14176,6 +14176,21 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
+    token_calls: list[int] = []
+
+    def _shared_auth_factory() -> str:
+        token_calls.append(1)
+        return "shared-runner-token"
+
+    def _unexpected_auth_resolution(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("terminal launch must reuse the runner auth factory")
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        _unexpected_auth_resolution,
+    )
+
     # The real forwarder opens an HTTP stream to the server; stub it so
     # the auto-create flow runs without network. The created task is
     # scheduled and completes immediately. Capture the kwargs so the
@@ -14225,6 +14240,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        auth_token_factory=_shared_auth_factory,
     )
 
     spec = captured["spec"]
@@ -14247,6 +14263,8 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
         bridge_dir_for_bridge_id("4e92b5a0c0ee6db3f874f9c4a3f855a5")
     )
     assert config["ap_server_url"] == "http://127.0.0.1:8000"
+    assert config["ap_auth_headers"]["Authorization"] == "Bearer shared-runner-token"
+    assert token_calls == [1]
 
     # The forwarder must get a refresh-capable httpx.Auth (not just a
     # one-shot Authorization header) so a long-running host-spawned
@@ -14257,6 +14275,56 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 
     await asyncio.sleep(0)
     assert isinstance(forwarder_kwargs.get("auth"), _RunnerDatabricksAuth)
+
+
+@pytest.mark.asyncio
+async def test_claude_permission_hook_snapshot_refreshes_without_binding_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parent runner refreshes delegated hook auth in the bridge file."""
+    import omnigent.runner.app as runner_app_mod
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(
+        runner_app_mod,
+        "_PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    bridge_dir = prepare_bridge_dir("refresh-hook-auth", workspace=tmp_path)
+    claude_native_bridge.build_hook_settings(
+        bridge_dir,
+        ap_server_url="https://omnigent.example.com",
+        ap_auth_headers={"Authorization": "Bearer old-token"},
+    )
+
+    task = asyncio.create_task(
+        runner_app_mod._refresh_claude_permission_hook_auth(
+            bridge_dir=bridge_dir,
+            server_url="https://omnigent.example.com",
+            auth_token_factory=lambda: "fresh-delegated-token",
+        )
+    )
+    try:
+
+        async def _wait_for_refresh() -> None:
+            while True:
+                config = read_permission_hook_config(bridge_dir)
+                if config.get("ap_auth_headers", {}).get("Authorization") == (
+                    "Bearer fresh-delegated-token"
+                ):
+                    return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_wait_for_refresh(), timeout=1.0)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    config = read_permission_hook_config(bridge_dir)
+    assert config["ap_auth_headers"]["Authorization"] == "Bearer fresh-delegated-token"
 
 
 @pytest.mark.asyncio

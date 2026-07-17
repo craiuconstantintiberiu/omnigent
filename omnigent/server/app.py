@@ -2459,14 +2459,12 @@ def create_app(
             )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
-        """Owner for a server-managed sandbox runner, by its bound session.
+        """Owner for a delegated runner, by its bound session.
 
-        Managed runners authenticate with a server-minted binding token,
-        not a user session, so the runner tunnel cannot resolve their
-        owner from the handshake. The server wrote ``runner_id`` onto the
-        session row at launch (``replace_runner_id``), so the bound
-        conversation's owner is authoritative — the runner-side analog of
-        the host tunnel's ``resolve_launch_token``.
+        Host-launched and managed-sandbox runners authenticate with a binding
+        token instead of inheriting the host user's credential. The server
+        wrote ``runner_id`` onto the session row before launch, so the bound
+        conversation's owner is authoritative.
 
         :param runner_id: Token-bound runner id from the tunnel handshake.
         :returns: The session owner's user id, or ``None`` when no session
