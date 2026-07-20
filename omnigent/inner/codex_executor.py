@@ -694,9 +694,9 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     The executor overrides ``CODEX_HOME`` to a per-conversation temp
     directory so session data (conversation history, etc.) stays isolated
     from the user's ``~/.codex/``. However, the codex CLI also reads
-    authentication tokens (``auth.json``) and provider configuration
-    (``config.toml``) from ``$CODEX_HOME``. This helper bridges those
-    files into the temp directory:
+    authentication tokens (``auth.json``), provider configuration
+    (``config.toml``) and instructions (``AGENTS.md``, ``AGENTS.override.md``)
+    from ``$CODEX_HOME``. This helper bridges those files into the temp directory:
 
     - ``auth.json`` is **symlinked** so OAuth token refreshes written to
       the real home propagate to running sessions without delay.
@@ -704,6 +704,8 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
       only to the session's own private copy and never mutates the shared
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
       enforcement isolated between concurrent sessions.
+    - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
+      are respected.
 
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
