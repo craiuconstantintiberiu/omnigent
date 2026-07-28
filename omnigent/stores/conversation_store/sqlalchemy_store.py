@@ -1779,6 +1779,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     select(SqlConversationItem.position)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
                         SqlConversationItem.id == after,
                     )
                     .scalar_subquery()
@@ -1794,6 +1795,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     select(SqlConversationItem.position)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
                         SqlConversationItem.id == before,
                     )
                     .scalar_subquery()
