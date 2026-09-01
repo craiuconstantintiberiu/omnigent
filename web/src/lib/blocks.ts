@@ -147,6 +147,7 @@ export interface ToolResultBlock {
   callId: string;
   agentName: string;
   output: string;
+  outputTruncated?: boolean;
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */

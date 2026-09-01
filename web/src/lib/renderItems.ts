@@ -64,6 +64,8 @@ export type RenderItem =
       itemId: string | null;
       execution: ToolExecution;
       output: string | null;
+      outputItemId?: string | null;
+      outputTruncated?: boolean;
       state: ToolState;
       startedAt: number | null;
       duration: number | undefined;
@@ -1660,7 +1662,17 @@ function toolItem(
     state = "no-output";
   }
 
-  return { kind: "tool", itemId, execution, output, state, startedAt, duration };
+  return {
+    kind: "tool",
+    itemId,
+    execution,
+    output,
+    outputItemId: result?.ctx.itemId,
+    outputTruncated: result?.outputTruncated,
+    state,
+    startedAt,
+    duration,
+  };
 }
 
 /** Same keys, each value strictly equal. */

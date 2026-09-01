@@ -645,6 +645,7 @@ describe("buildBubbles — tool joining", () => {
         callId: "c1",
         agentName: "test",
         output: "file content",
+        outputTruncated: true,
       },
     ];
     const bubbles = buildBubbles(blocks, null);
@@ -654,6 +655,8 @@ describe("buildBubbles — tool joining", () => {
     expect(t.kind).toBe("tool");
     expect(t.execution.callId).toBe("c1");
     expect(t.output).toBe("file content");
+    expect(t.outputItemId).toBe("fco_1");
+    expect(t.outputTruncated).toBe(true);
     expect(t.state).toBe("output-available");
     expect(t.itemId).toBe("fc_1");
     expect(t.startedAt).toBe(10);

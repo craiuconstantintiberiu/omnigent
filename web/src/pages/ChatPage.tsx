@@ -3584,6 +3584,7 @@ function AssistantBubble({
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
+            sessionId={conversationId ?? undefined}
             turnLifecycle={bubble.lifecycle}
             workedForS={bubble.workedForS}
             continued={bubble.continued}

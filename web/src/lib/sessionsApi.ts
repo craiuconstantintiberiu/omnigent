@@ -10,7 +10,7 @@
 // helpers below convert at the boundary so callers never see raw
 // wire fields.
 
-import type { ConversationItem } from "./conversationItems";
+import { isFunctionCallOutputItem, type ConversationItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
@@ -972,7 +972,11 @@ export async function fetchSessionItemsPage(
   sessionId: string,
   { olderThan, limit = SESSION_HISTORY_PAGE_SIZE }: { olderThan?: string; limit?: number } = {},
 ): Promise<SessionItemsPage> {
-  const params = new URLSearchParams({ limit: String(limit), order: "desc" });
+  const params = new URLSearchParams({
+    limit: String(limit),
+    order: "desc",
+    preview_tool_outputs: "true",
+  });
   // "Older than the cursor" within a descending scan = items after it.
   if (olderThan) params.set("after", olderThan);
   const res = await authenticatedFetch(
@@ -981,6 +985,17 @@ export async function fetchSessionItemsPage(
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
   // Server returns newest-first; reverse to chronological for rendering.
   return { items: [...page.data].reverse(), hasMore: page.has_more };
+}
+
+export async function fetchSessionToolOutput(sessionId: string, itemId: string): Promise<string> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/items/${encodeURIComponent(itemId)}`,
+  );
+  const item = await readJsonOrThrow<ConversationItem>(res);
+  if (!isFunctionCallOutputItem(item)) {
+    throw new Error(`Conversation item ${itemId} is not a tool output`);
+  }
+  return item.output;
 }
 
 /**

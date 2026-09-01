@@ -362,6 +362,7 @@ function functionCallOutputToBlock(item: FunctionCallOutputItem): ToolResultBloc
     callId: item.call_id,
     agentName: ctx.agent ?? "",
     output: item.output,
+    outputTruncated: item.output_truncated,
   };
 }
 

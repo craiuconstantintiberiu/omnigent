@@ -12,6 +12,7 @@ import {
   bindOnlyOnlineRunner,
   createSession,
   fetchSessionItemsPage,
+  fetchSessionToolOutput,
   forkSession,
   getSession,
   getSessionSlim,
@@ -827,7 +828,7 @@ describe("fetchSessionItemsPage", () => {
     // One descending request at the default page size, no cursor.
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(String(fetchMock.mock.calls[0]![0])).toBe(
-      `/v1/sessions/conv%20with%20space/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
+      `/v1/sessions/conv%20with%20space/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc&preview_tool_outputs=true`,
     );
   });
 
@@ -850,7 +851,46 @@ describe("fetchSessionItemsPage", () => {
     // "after" means lower position = older items. Sending `before` here
     // (the pre-fix shape) would return the conversation's start instead.
     expect(String(fetchMock.mock.calls[0]![0])).toBe(
-      "/v1/sessions/conv_abc/items?limit=25&order=desc&after=msg_50",
+      "/v1/sessions/conv_abc/items?limit=25&order=desc&preview_tool_outputs=true&after=msg_50",
+    );
+  });
+});
+
+describe("fetchSessionToolOutput", () => {
+  it("returns a persisted tool output", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "fco_1",
+        response_id: "resp_1",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "c1",
+        output: "complete output",
+      }),
+    );
+
+    await expect(fetchSessionToolOutput("conv with space", "item/1")).resolves.toBe(
+      "complete output",
+    );
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      "/v1/sessions/conv%20with%20space/items/item%2F1",
+    );
+  });
+
+  it("rejects an item that is not a tool output", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "msg_1",
+        response_id: "resp_1",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [],
+      }),
+    );
+
+    await expect(fetchSessionToolOutput("conv_1", "msg_1")).rejects.toThrow(
+      "Conversation item msg_1 is not a tool output",
     );
   });
 });

@@ -559,6 +559,15 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_item(
+        self,
+        conversation_id: str,
+        item_id: str,
+    ) -> ConversationItem | None:
+        """Return an item from a conversation, or ``None`` if it does not exist."""
+        ...
+
+    @abstractmethod
     def list_items(
         self,
         conversation_id: str,

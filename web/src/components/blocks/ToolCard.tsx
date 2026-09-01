@@ -28,6 +28,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
+import { fetchSessionToolOutput } from "@/lib/sessionsApi";
 import { iconForTool } from "@/lib/toolIcon";
 import {
   type ToolRunCall,
@@ -160,6 +161,9 @@ interface ToolCardProps {
   arguments: Record<string, unknown>;
   /** Tool output, or null if not yet available / never produced. */
   output: string | null;
+  outputTruncated?: boolean;
+  sessionId?: string;
+  outputItemId?: string | null;
   state: ToolState;
   /** Seconds from the page's performance clock when the tool call rendered. */
   startedAt?: number | null;
@@ -173,18 +177,24 @@ export function ToolCard({
   argsSummary,
   arguments: args,
   output,
+  outputTruncated = false,
+  sessionId,
+  outputItemId,
   state,
   startedAt,
   duration,
 }: ToolCardProps) {
   const title = useMemo(() => formatToolTitle(name, args, argsSummary), [name, args, argsSummary]);
   const inputJson = useMemo(() => JSON.stringify(args, null, 2), [args]);
-  const formattedOutput = useMemo(
-    () => (output === null ? null : prettyPrintIfJson(output)),
-    [output],
-  );
   const elapsedDuration = useElapsedDuration(state === "input-available" ? startedAt : null);
   const displayDuration = duration ?? elapsedDuration;
+  const loadFullOutput = useMemo(
+    () =>
+      sessionId !== undefined && outputItemId != null
+        ? () => fetchSessionToolOutput(sessionId, outputItemId)
+        : undefined,
+    [outputItemId, sessionId],
+  );
 
   // When this is a file-path tool and we're inside AppShell, make the path
   // in the trigger row a clickable link that opens the FileViewer.
@@ -215,11 +225,17 @@ export function ToolCard({
           copyText={inputJson}
           copyLabel="Copy parameters"
         />
-        {formattedOutput !== null && <OutputSection output={formattedOutput} />}
-        {formattedOutput === null && state === "input-available" && (
+        {output !== null && (
+          <OutputSection
+            output={output}
+            outputTruncated={outputTruncated}
+            loadFullOutput={loadFullOutput}
+          />
+        )}
+        {output === null && state === "input-available" && (
           <ToolPendingOutput duration={displayDuration} />
         )}
-        {formattedOutput === null &&
+        {output === null &&
           (state === "output-error" || state === "cancelled" || state === "no-output") && (
             <EmptyOutputState state={state} />
           )}
@@ -235,7 +251,13 @@ export function ToolCard({
  * tools fold here: older tools once the visible tail of the most
  * recent ones has been peeled off.
  */
-export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
+export function ToolGroupSummary({
+  tools,
+  sessionId,
+}: {
+  tools: RenderItem[];
+  sessionId?: string;
+}) {
   const label = formatToolRunLabel(tools.map(toolRunCall));
   return (
     // Named `group/tool-summary` so this collapsible only rotates its
@@ -258,6 +280,9 @@ export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
                 argsSummary={item.execution.argsSummary}
                 arguments={item.execution.arguments}
                 output={item.output}
+                outputTruncated={item.outputTruncated}
+                sessionId={sessionId}
+                outputItemId={item.outputItemId}
                 state={item.state}
                 startedAt={item.startedAt}
                 duration={item.duration}
@@ -414,13 +439,70 @@ function CodePanel({
   );
 }
 
-function OutputSection({ output }: { output: string }) {
+function OutputSection({
+  output,
+  outputTruncated,
+  loadFullOutput,
+}: {
+  output: string;
+  outputTruncated: boolean;
+  loadFullOutput?: () => Promise<string>;
+}) {
   const [isExpanded, setIsExpanded] = useState(false);
-  useEffect(() => setIsExpanded(false), [output]);
+  const [fullOutput, setFullOutput] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const requestId = useRef(0);
+  useEffect(() => {
+    requestId.current += 1;
+    setIsExpanded(false);
+    setFullOutput(null);
+    setIsLoading(false);
+    setLoadError(null);
+    return () => {
+      requestId.current += 1;
+    };
+  }, [loadFullOutput, output, outputTruncated]);
 
-  const collapsedPreview = useMemo(() => getOutputPreview(output), [output]);
-  const preview = useMemo(() => getOutputPreview(output, isExpanded), [output, isExpanded]);
-  const canExpand = collapsedPreview.isTruncated;
+  const visibleOutput = fullOutput ?? output;
+  const formattedOutput = useMemo(() => prettyPrintIfJson(visibleOutput), [visibleOutput]);
+  const collapsedPreview = useMemo(() => getOutputPreview(formattedOutput), [formattedOutput]);
+  const preview = useMemo(
+    () => getOutputPreview(formattedOutput, isExpanded),
+    [formattedOutput, isExpanded],
+  );
+  const fullOutputPending = outputTruncated && fullOutput === null;
+  const canExpand = collapsedPreview.isTruncated || fullOutputPending;
+
+  const toggleExpanded = useCallback(async () => {
+    if (isExpanded) {
+      setIsExpanded(false);
+      return;
+    }
+    if (!fullOutputPending) {
+      setIsExpanded(true);
+      return;
+    }
+    if (loadFullOutput === undefined) {
+      setLoadError("The complete output is unavailable.");
+      return;
+    }
+
+    const currentRequest = ++requestId.current;
+    setIsLoading(true);
+    setLoadError(null);
+    try {
+      const loaded = await loadFullOutput();
+      if (currentRequest !== requestId.current) return;
+      setFullOutput(loaded);
+      setIsExpanded(true);
+    } catch (error) {
+      if (currentRequest !== requestId.current) return;
+      setLoadError(error instanceof Error ? error.message : "Failed to load the complete output.");
+    } finally {
+      if (currentRequest === requestId.current) setIsLoading(false);
+    }
+  }, [fullOutputPending, isExpanded, loadFullOutput]);
 
   return (
     <div className="space-y-2">
@@ -432,7 +514,12 @@ function OutputSection({ output }: { output: string }) {
           (!canExpand || isExpanded) && "max-h-[36rem] overflow-auto",
         )}
       >
-        <CodePanel title="Output" text={preview.text} copyText={output} copyLabel="Copy output" />
+        <CodePanel
+          title="Output"
+          text={preview.text}
+          copyText={visibleOutput}
+          copyLabel={fullOutputPending ? "Copy preview" : "Copy output"}
+        />
         {canExpand && !isExpanded && (
           <div className="pointer-events-none absolute inset-x-px bottom-px h-16 rounded-b-md bg-gradient-to-t from-background to-transparent" />
         )}
@@ -445,21 +532,25 @@ function OutputSection({ output }: { output: string }) {
           </span>
           <Button
             className="w-fit"
-            onClick={() => setIsExpanded((value) => !value)}
+            disabled={isLoading}
+            onClick={() => void toggleExpanded()}
             size="xs"
             type="button"
             variant="outline"
             componentId="diagnostics.tool.toggle_expanded"
           >
-            {isExpanded ? (
+            {isLoading ? (
+              <Loader2Icon className="size-3 animate-spin" />
+            ) : isExpanded ? (
               <Minimize2Icon className="size-3" />
             ) : (
               <Maximize2Icon className="size-3" />
             )}
-            {isExpanded ? "Collapse" : "Expand"}
+            {isLoading ? "Loading" : isExpanded ? "Collapse" : "Expand"}
           </Button>
         </div>
       )}
+      {loadError !== null && <p className="text-destructive text-sm">{loadError}</p>}
     </div>
   );
 }

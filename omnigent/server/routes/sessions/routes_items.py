@@ -10,6 +10,8 @@ from fastapi import (
     Request,
 )
 
+from omnigent.entities import ConversationItem
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -44,6 +46,22 @@ from omnigent.server.schemas import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
+_TOOL_OUTPUT_PREVIEW_LIMIT = 12_000
+
+
+def _item_dict(item: ConversationItem, preview_tool_outputs: bool) -> dict[str, object]:
+    data = item.to_api_dict()
+    output = data.get("output")
+    if (
+        preview_tool_outputs
+        and data.get("type") == "function_call_output"
+        and isinstance(output, str)
+        and len(output) > _TOOL_OUTPUT_PREVIEW_LIMIT
+    ):
+        data["output"] = output[:_TOOL_OUTPUT_PREVIEW_LIMIT]
+        data["output_truncated"] = True
+    return data
+
 
 def register_items_routes(
     router: APIRouter,
@@ -67,6 +85,7 @@ def register_items_routes(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
+        preview_tool_outputs: bool = Query(default=False),
     ) -> PaginatedList:
         """
         List items in a session with cursor-based pagination.
@@ -103,13 +122,35 @@ def register_items_routes(
             before=before,
             order=order,
         )
-        data = [m.to_api_dict() for m in page.data]
+        data = [_item_dict(item, preview_tool_outputs) for item in page.data]
         return PaginatedList(
             data=data,
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
         )
+
+    @router.get(
+        "/sessions/{session_id}/items/{item_id}",
+        response_model=None,
+    )
+    async def get_session_item(
+        request: Request,
+        session_id: str,
+        item_id: str,
+    ) -> dict[str, object]:
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+        )
+        item = await asyncio.to_thread(conversation_store.get_item, session_id, item_id)
+        if item is None:
+            raise OmnigentError("Conversation item not found", code=ErrorCode.NOT_FOUND)
+        return item.to_api_dict()
 
     # ── GET /sessions/{session_id}/child_sessions ────────────────
 

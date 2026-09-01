@@ -72,6 +72,7 @@ function functionCallOutput(
   callId: string,
   output: string,
   id = `fco_${callId}`,
+  outputTruncated = false,
 ): ConversationItem {
   return {
     id,
@@ -80,6 +81,7 @@ function functionCallOutput(
     status: "completed",
     call_id: callId,
     output,
+    ...(outputTruncated ? { output_truncated: true } : {}),
   };
 }
 
@@ -318,6 +320,20 @@ describe("itemsToBlocks — tool calls", () => {
     for (const b of blocks) {
       expect(b.ctx.responseId).toBe("resp_1");
     }
+  });
+
+  it("preserves the output item id and truncation marker", () => {
+    const blocks = itemsToBlocks([
+      functionCallOutput("resp_1", "c1", "output prefix", "fco_preview", true),
+    ]);
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      type: "tool_result",
+      ctx: { itemId: "fco_preview" },
+      output: "output prefix",
+      outputTruncated: true,
+    });
   });
 
   it("malformed JSON arguments fall back to {} without crashing", () => {

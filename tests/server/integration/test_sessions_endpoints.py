@@ -3250,6 +3250,56 @@ async def test_list_session_items_returns_items(
     assert all(isinstance(i.get("created_at"), int) and i["created_at"] > 0 for i in items)
 
 
+async def test_large_tool_output_is_previewed_and_retrievable(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    from omnigent.entities import FunctionCallOutputData, NewConversationItem
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    output = "tool output\n" * 2_000
+    store = SqlAlchemyConversationStore(db_uri)
+    persisted = await asyncio.to_thread(
+        store.append,
+        session["id"],
+        [
+            NewConversationItem(
+                type="function_call_output",
+                response_id="resp_large_output",
+                data=FunctionCallOutputData(call_id="call_large_output", output=output),
+            )
+        ],
+    )
+    item_id = persisted[0].id
+
+    preview_response = await client.get(
+        f"/v1/sessions/{session['id']}/items",
+        params={"preview_tool_outputs": "true"},
+    )
+    assert preview_response.status_code == 200
+    preview = next(item for item in preview_response.json()["data"] if item["id"] == item_id)
+    assert preview["output_truncated"] is True
+    assert output.startswith(preview["output"])
+    assert len(preview["output"]) < len(output)
+
+    default_response = await client.get(f"/v1/sessions/{session['id']}/items")
+    assert default_response.status_code == 200
+    default_item = next(item for item in default_response.json()["data"] if item["id"] == item_id)
+    assert default_item["output"] == output
+    assert "output_truncated" not in default_item
+
+    item_response = await client.get(f"/v1/sessions/{session['id']}/items/{item_id}")
+    assert item_response.status_code == 200
+    assert item_response.json()["output"] == output
+
+    other_session = await _create_session(client, agent["id"])
+    scoped_response = await client.get(
+        f"/v1/sessions/{other_session['id']}/items/{item_id}",
+    )
+    assert scoped_response.status_code == 404
+
+
 async def test_list_session_items_pagination(
     client: httpx.AsyncClient,
 ) -> None:
