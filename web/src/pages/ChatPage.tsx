@@ -4459,7 +4459,7 @@ export function Composer({
   // "Attach to agent" gate (``canAttachToAgent``), which already uses it.
   const mentionEnabled = nativeCodingAgentForHarness(sessionHarness) !== undefined;
   const workspaceFilesQuery = useWorkspaceAllFiles(conversationId ?? undefined, {
-    enabled: mentionEnabled,
+    enabled: mentionEnabled && mention !== null,
   });
   const valueRef = useRef(value);
   valueRef.current = value;

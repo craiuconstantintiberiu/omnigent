@@ -11,6 +11,13 @@ import { useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
+vi.hoisted(() => {
+  Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
+    configurable: true,
+    value: vi.fn(() => null),
+  });
+});
+
 // Drill-down "@"-mention browses one directory at a time, so the test stubs
 // both sources: the root listing (useWorkspaceAllFiles) and the per-directory
 // listing (useWorkspaceDirectory). Root holds a "src" folder + a file; "src"
@@ -24,6 +31,7 @@ const ws = vi.hoisted(() => ({
   srcEntries: [] as unknown[],
   rootLoading: false,
   dirLoading: false,
+  rootQueryEnabled: [] as boolean[],
 }));
 const ROOT_ENTRIES: WorkspaceFile[] = [
   { path: "src", name: "src", type: "directory", bytes: null, modified_at: null },
@@ -38,15 +46,22 @@ function resetWorkspaceMock() {
   ws.srcEntries = SRC_ENTRIES;
   ws.rootLoading = false;
   ws.dirLoading = false;
+  ws.rootQueryEnabled = [];
 }
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
     ...actual,
-    useWorkspaceAllFiles: () => ({
-      data: { available: true, data: ws.rootEntries },
-      isLoading: ws.rootLoading,
-    }),
+    useWorkspaceAllFiles: (
+      _conversationId: string | undefined,
+      options: { enabled?: boolean } = {},
+    ) => {
+      ws.rootQueryEnabled.push(options.enabled ?? true);
+      return {
+        data: { available: true, data: ws.rootEntries },
+        isLoading: ws.rootLoading,
+      };
+    },
     useWorkspaceDirectory: (_conv: string | undefined, dirPath: string | null) => ({
       data: dirPath === "src" ? ws.srcEntries : undefined,
       isLoading: ws.dirLoading,
@@ -226,6 +241,17 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     type("@");
     expect(screen.getByTitle("Open src")).toBeInTheDocument();
     expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
+  });
+
+  it("loads the root directory only while an '@' mention is active", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(ws.rootQueryEnabled.at(-1)).toBe(false);
+
+    type("@");
+    expect(ws.rootQueryEnabled.at(-1)).toBe(true);
+
+    type("@src ");
+    expect(ws.rootQueryEnabled.at(-1)).toBe(false);
   });
 
   it("opens a folder to reveal nested files, then delivers the chosen file", () => {
