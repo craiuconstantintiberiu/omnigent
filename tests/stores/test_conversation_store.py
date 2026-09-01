@@ -1448,11 +1448,11 @@ def test_list_conversations_no_search_skips_statement_timeout(
     assert not any("statement_timeout" in s.lower() for s in statements), statements
 
 
-def test_list_conversations_search_content_match_is_correlated(
+def test_list_conversations_short_search_content_match_is_correlated(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    The content-search predicate is a correlated ``EXISTS``, not an
+    The short-query content-search predicate is a correlated ``EXISTS``, not an
     uncorrelated ``id IN (SELECT DISTINCT ...)``.
 
     The IN form materializes the match set for the entire workspace before the
@@ -1481,7 +1481,7 @@ def test_list_conversations_search_content_match_is_correlated(
 
     statements = _captured_sql(
         conversation_store,
-        lambda: conversation_store.list_conversations(search_query="deployment"),
+        lambda: conversation_store.list_conversations(search_query="de"),
     )
     select_sql = " ".join(s for s in statements if "conversation_items" in s).lower()
     assert "exists" in select_sql, select_sql
@@ -1526,9 +1526,8 @@ def test_search_predicate_avoids_the_trigram_index_expression(
     page = conversation_store.list_conversations(search_query="deployment")
     assert conv.id in {c.id for c in page.data}
 
-    # The SQL-shape guarantee is Postgres-specific: SQLAlchemy emits native
-    # ILIKE there, while SQLite (which has no trigram index to avoid) compiles
-    # ILIKE down to lower(...) LIKE lower(...).
+    # The SQL-shape guarantee is Postgres-specific because it concerns the
+    # Postgres pg_trgm index expression.
     if conversation_store._conv_engine.dialect.name != "postgresql":
         return
 

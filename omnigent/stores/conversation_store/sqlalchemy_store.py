@@ -53,6 +53,7 @@ from omnigent.db.enum_codecs import (
 )
 from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
+    _TRIGRAM_FTS_TABLE,
     _supports_fts5,
     build_search_snippet,
     delete_fts_by_conversation_ids,
@@ -66,6 +67,7 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     now_epoch,
     strip_nul_bytes,
+    supports_trigram_fts,
 )
 from omnigent.entities import (
     Conversation,
@@ -99,16 +101,14 @@ from omnigent.stores.conversation_store import (
 _logger = logging.getLogger(__name__)
 
 # Server-side deadline (ms) for the content-search query in
-# ``list_conversations``. Session search matches ``LOWER(search_text) LIKE
-# '%q%'`` across ``conversation_items``; that is index-backed by the pg_trgm
-# GIN index (migration ``d5e9f1a2b3c4``), but if the index is ever missing the
-# scan can run unbounded and — since the query runs in a worker thread — a
-# client disconnect does not stop it. ``SET LOCAL statement_timeout`` caps it so
-# a degraded deployment fails the search fast instead of pinning a DB
-# connection. Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks
-# to the connection's next pooled use. Longer than the client's own
+# ``list_conversations``. The PostgreSQL content path can scan large item
+# histories, and a client disconnect does not stop its worker thread.
+# ``SET LOCAL statement_timeout`` caps it instead of pinning a connection.
+# Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks to the
+# connection's next pooled use. Longer than the client's own
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
+_TRIGRAM_MIN_QUERY_CHARS = 3
 
 # How many co-located sessions ``has_other_live_session_in_workspace`` will
 # name before it stops looking. Real directories hold one or two sessions; the
@@ -149,6 +149,11 @@ def _encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
         key: overrides[key] for key in _SESSION_OVERRIDE_KEYS if overrides.get(key) is not None
     }
     return json.dumps(data, separators=(",", ":")) if data else None
+
+
+def _literal_fts_query(query: str) -> str:
+    escaped = query.replace('"', '""')
+    return f'"{escaped}"'
 
 
 def _decode_session_overrides(raw: str | None) -> dict[str, str | None]:
@@ -797,6 +802,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             else cast(ColumnElement[Any], SqlConversation.id)
         )
         ensure_fts_table(self._conv_engine)
+        self._trigram_search = supports_trigram_fts(self._conv_engine)
 
     def _get_meta(
         self, _unused_session: Session, conversation_id: str
@@ -2283,9 +2289,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             otherwise matches conversations where
             ``LOWER(title) LIKE %query%`` or any
             ``conversation_items.search_text`` contains the
-            query. Implemented with the SQL ``LIKE`` operator
-            (no FTS) so it works against both SQLite and
-            Postgres without extra extensions.
+            query. SQLite uses a trigram FTS index for queries of at
+            least three characters when available. Short queries and
+            other databases use a SQL ``LIKE`` predicate.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -2435,29 +2441,41 @@ class SqlAlchemyConversationStore(ConversationStore):
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
-                # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
-                # form is uncorrelated, so the match set is built for the WHOLE
-                # workspace before the outer query discards every row the caller
-                # cannot see. Correlating on conversation_id keeps each probe on
-                # the (workspace_id, conversation_id) index and lets it stop at
-                # the first matching item per conversation.
-                # ``ILIKE`` on the raw column, NOT ``lower(search_text) LIKE``:
-                # the latter matches the ``lower(search_text)`` pg_trgm index
-                # expression, and the planner then prefers that index — scanning
-                # every item in the workspace out of a multi-GB index that does
-                # not fit in shared_buffers. ILIKE is the same case-insensitive
-                # match but cannot use that index, so the probe stays on the
-                # (workspace_id, conversation_id) btree above. Do not "simplify"
-                # this back to lower(...) LIKE; see the covering test.
-                content_match = (
-                    select(SqlConversationItem.conversation_id)
-                    .where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern),
+                if self._trigram_search and len(search_query) >= _TRIGRAM_MIN_QUERY_CHARS:
+                    content_match = SqlConversation.id.in_(
+                        text(
+                            f"SELECT conversation_id FROM {_TRIGRAM_FTS_TABLE} "
+                            "WHERE workspace_id = :fts_workspace_id "
+                            "AND search_text MATCH :fts_query"
+                        ).bindparams(
+                            fts_workspace_id=current_workspace_id(),
+                            fts_query=_literal_fts_query(search_query),
+                        )
                     )
-                    .exists()
-                )
+                else:
+                    # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
+                    # form is uncorrelated, so the match set is built for the WHOLE
+                    # workspace before the outer query discards every row the caller
+                    # cannot see. Correlating on conversation_id keeps each probe on
+                    # the (workspace_id, conversation_id) index and lets it stop at
+                    # the first matching item per conversation.
+                    # ``ILIKE`` on the raw column, NOT ``lower(search_text) LIKE``:
+                    # the latter matches the ``lower(search_text)`` pg_trgm index
+                    # expression, and the planner then prefers that index — scanning
+                    # every item in the workspace out of a multi-GB index that does
+                    # not fit in shared_buffers. ILIKE is the same case-insensitive
+                    # match but cannot use that index, so the probe stays on the
+                    # (workspace_id, conversation_id) btree above. Do not "simplify"
+                    # this back to lower(...) LIKE; see the covering test.
+                    content_match = (
+                        select(SqlConversationItem.conversation_id)
+                        .where(
+                            SqlConversationItem.workspace_id == current_workspace_id(),
+                            SqlConversationItem.conversation_id == SqlConversation.id,
+                            SqlConversationItem.search_text.ilike(pattern),
+                        )
+                        .exists()
+                    )
                 stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
