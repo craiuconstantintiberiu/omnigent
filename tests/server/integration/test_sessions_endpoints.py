@@ -3279,6 +3279,74 @@ async def test_list_session_items_404_for_nonexistent(
     assert resp.status_code == 404
 
 
+async def test_list_session_items_revalidates_when_tail_changes(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="etag tail")
+    await _wait_for_idle(client, session["id"])
+
+    first = await client.get(f"/v1/sessions/{session['id']}/items")
+    etag = first.headers["etag"]
+    assert first.headers["cache-control"] == "private, no-cache"
+    assert "X-Forwarded-Email" in first.headers["vary"]
+
+    unchanged = await client.get(
+        f"/v1/sessions/{session['id']}/items",
+        headers={"If-None-Match": etag},
+    )
+    assert unchanged.status_code == 304
+    assert unchanged.content == b""
+
+    store = SqlAlchemyConversationStore(db_uri)
+    await asyncio.to_thread(
+        store.append,
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_etag_tail",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "tail changed"}],
+                ),
+            )
+        ],
+    )
+
+    changed = await client.get(
+        f"/v1/sessions/{session['id']}/items",
+        headers={"If-None-Match": etag},
+    )
+    assert changed.status_code == 200
+    assert changed.headers["etag"] != etag
+
+
+async def test_list_session_items_marks_history_immutable(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="etag history")
+    await _wait_for_idle(client, session["id"])
+
+    newest = await client.get(
+        f"/v1/sessions/{session['id']}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    cursor = newest.json()["last_id"]
+    history = await client.get(
+        f"/v1/sessions/{session['id']}/items",
+        params={"limit": 100, "order": "desc", "after": cursor},
+    )
+
+    assert history.status_code == 200
+    assert history.headers["cache-control"] == "private, max-age=86400, immutable"
+    assert "etag" in history.headers
+
+
 # ── GET /v1/sessions/{id} snapshot fields ────────────────
 
 

@@ -471,7 +471,7 @@ export async function authenticatedFetch(
   let res = await hostFetch(url, {
     ...init,
     headers,
-    cache: "no-store",
+    cache: init?.cache ?? "no-store",
   });
 
   // Wrong-replica fallback: a keyed request that reached the wrong replica comes
@@ -489,7 +489,7 @@ export async function authenticatedFetch(
     res = await hostFetch(url, {
       ...init,
       headers: retryHeaders,
-      cache: "no-store",
+      cache: init?.cache ?? "no-store",
     });
     // Sticky demotion: the keyless re-address PROVED this host routes keyless
     // (the keyed attempt returned wrong_replica, the keyless one didn't).

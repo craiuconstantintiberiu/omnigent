@@ -977,6 +977,7 @@ export async function fetchSessionItemsPage(
   if (olderThan) params.set("after", olderThan);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    { cache: "default" },
   );
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
   // Server returns newest-first; reverse to chronological for rendering.

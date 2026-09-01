@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 
 from fastapi import (
     APIRouter,
     Query,
     Request,
+    Response,
+    status,
 )
 
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -44,6 +47,30 @@ from omnigent.server.schemas import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
+_ITEMS_IMMUTABLE_CACHE = "private, max-age=86400, immutable"
+_ITEMS_REVALIDATE_CACHE = "private, no-cache"
+_ITEMS_VARY = "Authorization, Cookie, X-Forwarded-Email"
+
+
+def _items_etag(
+    first_id: str | None,
+    last_id: str | None,
+    count: int,
+    has_more: bool,
+) -> str:
+    value = repr((first_id, last_id, count, has_more)).encode()
+    digest = hashlib.sha256(value).hexdigest()[:16]
+    return f'W/"{digest}"'
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    if header is None:
+        return False
+    if header.strip() == "*":
+        return True
+    expected = etag.removeprefix("W/")
+    return any(part.strip().removeprefix("W/") == expected for part in header.split(","))
+
 
 def register_items_routes(
     router: APIRouter,
@@ -62,12 +89,13 @@ def register_items_routes(
     )
     async def list_session_items(
         request: Request,
+        response: Response,
         session_id: str,
         limit: int = Query(default=100, ge=1, le=1000),
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
-    ) -> PaginatedList:
+    ) -> PaginatedList | Response:
         """
         List items in a session with cursor-based pagination.
 
@@ -103,6 +131,18 @@ def register_items_routes(
             before=before,
             order=order,
         )
+        historical = (order == "desc" and after is not None) or (
+            order == "asc" and before is not None
+        )
+        etag = _items_etag(page.first_id, page.last_id, len(page.data), page.has_more)
+        headers = {
+            "Cache-Control": _ITEMS_IMMUTABLE_CACHE if historical else _ITEMS_REVALIDATE_CACHE,
+            "ETag": etag,
+            "Vary": _ITEMS_VARY,
+        }
+        if _etag_matches(request.headers.get("if-none-match"), etag):
+            return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+        response.headers.update(headers)
         data = [m.to_api_dict() for m in page.data]
         return PaginatedList(
             data=data,
