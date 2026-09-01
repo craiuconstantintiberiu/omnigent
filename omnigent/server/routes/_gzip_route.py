@@ -1,23 +1,4 @@
-"""Per-route gzip for endpoints that inline a whole file in their JSON body.
-
-Most JSON responses are bounded metadata, where compression buys little. The
-workspace-file reads are the exception: they return the file's entire contents
-in a ``content`` field, so an uncompressed response costs a full file transfer
-on every click. Source text compresses 70-300x, which turns a
-multi-hundred-millisecond download into a few milliseconds.
-
-This is a route class rather than an app- or router-level middleware so the
-route table stays the single source of truth for *which* endpoints compress.
-A middleware would have to re-derive that from the request path, duplicating
-the router's matching and — because a path alone says nothing about the method
-— wrapping the ``PUT``/``PATCH``/``DELETE`` handlers that share these paths.
-Starlette's ``Route.handle`` rejects a mismatched method before it reaches
-``self.app``, so a route class only ever wraps the methods its route declares.
-
-FastAPI's decorators expose neither Starlette's per-route ``middleware=`` nor a
-per-route class, so a custom :class:`~fastapi.routing.APIRoute` on a dedicated
-router is the supported equivalent; ``include_router`` preserves it.
-"""
+"""Gzip response handling with range and handler opt-outs."""
 
 from __future__ import annotations
 
@@ -139,6 +120,38 @@ class _StateAwareGZipResponder(GZipResponder):
         await super().send_with_compression(message)
 
 
+class StateAwareGZipMiddleware:
+    """Compress eligible HTTP responses."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        minimum_size: int = GZIP_MINIMUM_SIZE,
+        compresslevel: int = GZIP_COMPRESSLEVEL,
+    ) -> None:
+        self.app = app
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        if not _client_accepts_gzip(headers.get("Accept-Encoding", "")) or "range" in headers:
+            await self.app(scope, receive, send)
+            return
+
+        responder = _StateAwareGZipResponder(
+            self.app,
+            self.minimum_size,
+            self.compresslevel,
+            scope.setdefault("state", {}),
+        )
+        await responder(scope, receive, send)
+
+
 class GZipFileContentRoute(APIRoute):
     """
     Route class that gzips this route's responses.
@@ -195,5 +208,6 @@ __all__ = [
     "GZIP_MINIMUM_SIZE",
     "SKIP_GZIP_STATE_KEY",
     "GZipFileContentRoute",
+    "StateAwareGZipMiddleware",
     "skip_gzip",
 ]
