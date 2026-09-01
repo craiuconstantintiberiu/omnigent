@@ -77,6 +77,16 @@ function file(path: string, bytes = 10): WorkspaceFile {
   };
 }
 
+function directory(path: string): WorkspaceFile {
+  return {
+    bytes: null,
+    modified_at: null,
+    name: path.split("/").at(-1) ?? path,
+    path,
+    type: "directory",
+  };
+}
+
 function changedFile(
   path: string,
   status: WorkspaceChangedFile["status"] = "modified",
@@ -841,6 +851,51 @@ describe("FilesPanel tree (Explore) search", () => {
 
     // isSearching=true + searchResults=undefined → in-flight indicator
     expect(screen.getByText("Searching…")).toBeInTheDocument();
+  });
+
+  it("subscribes to an explicit directory only while it is expanded", () => {
+    useDirectoryMock.mockReturnValue(directoryResult([file("src/App.tsx")]));
+
+    render(
+      <TooltipProvider>
+        <FolderTree
+          files={[directory("src")]}
+          isLoading={false}
+          isError={false}
+          error={null}
+          onFileSelect={vi.fn()}
+          conversationId="conv_tree_lazy_directory"
+          showHidden={false}
+          changedFiles={[]}
+          sort="alpha"
+        />
+      </TooltipProvider>,
+    );
+
+    expect(useDirectoryMock).not.toHaveBeenCalled();
+
+    const folderButton = screen.getByRole("button", { name: /src\//i });
+    fireEvent.click(folderButton);
+    expect(useDirectoryMock).toHaveBeenCalledWith("conv_tree_lazy_directory", "src", "");
+    expect(screen.getByText("App.tsx")).toBeInTheDocument();
+
+    fireEvent.click(folderButton);
+    expect(screen.queryByText("App.tsx")).toBeNull();
+  });
+
+  it("mounts only the visible root rows for a large directory", () => {
+    const directories = Array.from({ length: 200 }, (_, index) =>
+      directory(`folder-${index.toString().padStart(3, "0")}`),
+    );
+    const view = renderPanel({ conversationId: "conv_tree_virtual_root", files: directories });
+    const section = view.container.querySelector("section");
+    if (!section) throw new Error("scroll section not found");
+
+    const mountedRows = section.querySelectorAll("button[aria-expanded]");
+    expect(mountedRows.length).toBeGreaterThan(0);
+    expect(mountedRows.length).toBeLessThan(directories.length);
+    expect(screen.getByRole("button", { name: /folder-000\//i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /folder-199\//i })).toBeNull();
   });
 
   it("aligns content at the same indentation for sibling folders and files (VS Code style)", () => {
