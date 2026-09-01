@@ -741,6 +741,8 @@ def test_git_list_changed_files_excludes_skip_dirs_via_pathspec(tmp_path: Path) 
     # Root-level skip dir: must be pruned.
     (tmp_path / "node_modules").mkdir()
     (tmp_path / "node_modules" / "big.js").write_text("x" * 10)
+    (tmp_path / ".codex-tmp").mkdir()
+    (tmp_path / ".codex-tmp" / "runner-state.jsonl").write_text("internal state")
     # A skip-dir name nested under a real source dir is NOT a root-level match,
     # so it stays visible — mirrors the first-component post-filter semantics.
     (tmp_path / "src" / "node_modules").mkdir(parents=True)
@@ -753,6 +755,9 @@ def test_git_list_changed_files_excludes_skip_dirs_via_pathspec(tmp_path: Path) 
     assert "real_change.py" in paths, f"Expected 'real_change.py' in results but got {paths}."
     assert not any(p.startswith("node_modules/") for p in paths), (
         f"Root-level node_modules/ should be pruned but got {paths}."
+    )
+    assert not any(p.startswith(".codex-tmp/") for p in paths), (
+        f"Root-level .codex-tmp/ should be pruned but got {paths}."
     )
     assert "src/node_modules/keep.js" in paths, (
         f"Nested (non-root) node_modules should stay visible but got {paths}."

@@ -114,6 +114,7 @@ _EPHEMERAL_PATTERNS: tuple[str, ...] = (
 _SKIP_DIRS: frozenset[str] = frozenset(
     {
         ".git",
+        ".codex-tmp",
         "__pycache__",
         ".venv",
         "venv",
