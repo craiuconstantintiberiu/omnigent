@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 
 from fastapi import (
     APIRouter,
@@ -47,78 +46,27 @@ from omnigent.server.schemas import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
-# Cache-Control for the immutable (scroll-back) vs. live-tail item pages.
-# Committed items never mutate, so a page fully below the tail is immutable
-# and served with no revalidation; the tail may grow, so it is revalidated
-# against the ETag. Both are ``private`` — item bodies are per-session data
-# that a shared cache must never store.
-_SESSION_ITEMS_IMMUTABLE_MAX_AGE_S = 86400
-_SESSION_ITEMS_CACHE_IMMUTABLE = (
-    f"private, max-age={_SESSION_ITEMS_IMMUTABLE_MAX_AGE_S}, immutable"
-)
-_SESSION_ITEMS_CACHE_TAIL = "private, no-cache"
+_ITEMS_IMMUTABLE_CACHE = "private, max-age=86400, immutable"
+_ITEMS_REVALIDATE_CACHE = "private, no-cache"
+_ITEMS_VARY = "Authorization, Cookie, X-Forwarded-Email"
 
 
-def _session_items_cache_control(is_historical: bool) -> str:
-    """
-    Return the ``Cache-Control`` value for a session-items page.
-
-    :param is_historical: ``True`` when the page is bounded strictly below
-        the live tail (a scroll-back page that can never change), ``False``
-        for the growing tail.
-    :returns: The immutable policy for a historical page, else the
-        revalidate-always tail policy.
-    """
-    return _SESSION_ITEMS_CACHE_IMMUTABLE if is_historical else _SESSION_ITEMS_CACHE_TAIL
-
-
-def _session_items_etag(
+def _items_etag(
     first_id: str | None,
     last_id: str | None,
     count: int,
     has_more: bool,
 ) -> str:
-    """
-    Build a validator ETag for a page of session items.
-
-    Items are append-only, so a page's content is fully determined by its
-    boundary ids, its length, and whether more rows follow — no field of an
-    existing item can change without a new id appearing. The tag is weak
-    (``W/``) because it validates semantic page equivalence, not a
-    byte-exact body (gzip vs identity encodings share the same page).
-
-    :param first_id: Id of the first item in the page, or ``None`` when empty.
-    :param last_id: Id of the last item in the page, or ``None`` when empty.
-    :param count: Number of items in the page.
-    :param has_more: Whether more items exist beyond the page.
-    :returns: A weak ETag string, e.g. ``'W/"a1b2c3d4"'``.
-    """
-    digest = hashlib.sha256(f"{first_id}:{last_id}:{count}:{has_more}".encode()).hexdigest()[:16]
-    return f'W/"{digest}"'
+    return f'W/"{first_id or ""}:{last_id or ""}:{count}:{int(has_more)}"'
 
 
-def _if_none_match_matches(header_value: str | None, etag: str) -> bool:
-    """
-    Return whether an ``If-None-Match`` header matches *etag*.
-
-    Handles a comma-separated list of tags and normalizes the weak
-    prefix so a weak validator compares equal regardless of how the
-    client echoes it. ``*`` matches any current representation.
-
-    :param header_value: Raw ``If-None-Match`` request header, or ``None``.
-    :param etag: The ETag computed for the current page.
-    :returns: ``True`` when the client's cached copy is still current.
-    """
-    if not header_value:
+def _etag_matches(header: str | None, etag: str) -> bool:
+    if header is None:
         return False
-
-    def _normalize(tag: str) -> str:
-        return tag.strip().removeprefix("W/")
-
-    if header_value.strip() == "*":
+    if header.strip() == "*":
         return True
-    wanted = _normalize(etag)
-    return any(_normalize(candidate) == wanted for candidate in header_value.split(","))
+    expected = etag.removeprefix("W/")
+    return any(part.strip().removeprefix("W/") == expected for part in header.split(","))
 
 
 def register_items_routes(
@@ -152,17 +100,6 @@ def register_items_routes(
         the conversation_id. Same pagination contract as
         ``GET /v1/conversations/{id}/items``.
 
-        Conversation items are append-only and never rewritten in place, so
-        this endpoint is HTTP-cacheable. A page bounded strictly below the
-        live tail (a scroll-back request — one carrying an ``after`` /
-        ``before`` cursor with no more rows beyond it) can never change, so
-        it is served ``Cache-Control: immutable`` — the browser re-serves it
-        with no network round-trip at all. The live tail (the cursorless
-        open fetch, or any page with ``has_more``) can grow when the agent
-        commits a turn, so it is served ``no-cache`` with a validator
-        ``ETag``: the browser revalidates via ``If-None-Match`` and gets an
-        empty ``304`` when nothing changed, saving the body transfer.
-
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param limit: Maximum number of items to return
@@ -172,9 +109,7 @@ def register_items_routes(
         :param before: Cursor — return items before this item ID.
         :param order: Sort order, ``"asc"`` (chronological,
             default) or ``"desc"``.
-        :returns: A :class:`PaginatedList` of conversation items, or a bare
-            ``304`` :class:`Response` when the client's ``If-None-Match``
-            matches the current page.
+        :returns: A :class:`PaginatedList` of conversation items.
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
@@ -193,20 +128,18 @@ def register_items_routes(
             before=before,
             order=order,
         )
-        # A cursor-bounded page with nothing older/newer beyond it sits
-        # entirely below the live tail — since items never mutate, it is
-        # immutable and safe to cache with no revalidation. Everything else
-        # is (or touches) the growing tail: revalidate against the ETag.
-        is_historical = (after is not None or before is not None) and not page.has_more
-        etag = _session_items_etag(page.first_id, page.last_id, len(page.data), page.has_more)
-        cache_control = _session_items_cache_control(is_historical)
-        if _if_none_match_matches(request.headers.get("if-none-match"), etag):
-            not_modified = Response(status_code=status.HTTP_304_NOT_MODIFIED)
-            not_modified.headers["ETag"] = etag
-            not_modified.headers["Cache-Control"] = cache_control
-            return not_modified
-        response.headers["ETag"] = etag
-        response.headers["Cache-Control"] = cache_control
+        historical = (order == "desc" and after is not None) or (
+            order == "asc" and before is not None
+        )
+        etag = _items_etag(page.first_id, page.last_id, len(page.data), page.has_more)
+        headers = {
+            "Cache-Control": _ITEMS_IMMUTABLE_CACHE if historical else _ITEMS_REVALIDATE_CACHE,
+            "ETag": etag,
+            "Vary": _ITEMS_VARY,
+        }
+        if _etag_matches(request.headers.get("if-none-match"), etag):
+            return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+        response.headers.update(headers)
         data = [m.to_api_dict() for m in page.data]
         return PaginatedList(
             data=data,

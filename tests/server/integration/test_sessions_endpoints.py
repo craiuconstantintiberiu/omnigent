@@ -2685,82 +2685,28 @@ async def test_list_session_items_404_for_nonexistent(
     assert resp.status_code == 404
 
 
-async def test_list_session_items_tail_is_revalidatable(
+async def test_list_session_items_revalidates_when_tail_changes(
     client: httpx.AsyncClient,
+    db_uri: str,
 ) -> None:
-    """The live-tail page (cursorless open fetch) carries a validator ETag
-    and a no-cache policy, and a matching If-None-Match yields an empty 304."""
+    from omnigent.entities import MessageData, NewConversationItem
+
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"], initial_message="etag tail")
     await _wait_for_idle(client, session["id"])
 
-    resp = await client.get(f"/v1/sessions/{session['id']}/items")
-    assert resp.status_code == 200
-    etag = resp.headers.get("etag")
-    assert etag and etag.startswith('W/"')
-    # The tail can grow, so it must be revalidated, never cached blindly.
-    assert "no-cache" in resp.headers.get("cache-control", "")
+    first = await client.get(f"/v1/sessions/{session['id']}/items")
+    etag = first.headers["etag"]
+    assert first.headers["cache-control"] == "private, no-cache"
+    assert "X-Forwarded-Email" in first.headers["vary"]
 
-    # Re-request with the returned validator: unchanged → empty 304.
-    revalidated = await client.get(
+    unchanged = await client.get(
         f"/v1/sessions/{session['id']}/items",
         headers={"If-None-Match": etag},
     )
-    assert revalidated.status_code == 304
-    assert revalidated.headers.get("etag") == etag
-    assert revalidated.content == b""
+    assert unchanged.status_code == 304
+    assert unchanged.content == b""
 
-
-async def test_list_session_items_historical_page_is_immutable(
-    client: httpx.AsyncClient,
-) -> None:
-    """A cursor-bounded scroll-back page with nothing older beyond it is
-    immutable and served with a no-revalidation Cache-Control."""
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"], initial_message="etag history")
-    await _wait_for_idle(client, session["id"])
-
-    # Page backwards from the newest item: descending order past the tail.
-    newest = await client.get(
-        f"/v1/sessions/{session['id']}/items",
-        params={"limit": 1, "order": "desc"},
-    )
-    assert newest.status_code == 200
-    body = newest.json()
-    if not body["data"]:
-        pytest.skip("session has no items to page behind")
-    cursor = body["last_id"]
-
-    historical = await client.get(
-        f"/v1/sessions/{session['id']}/items",
-        params={"limit": 100, "order": "desc", "after": cursor},
-    )
-    assert historical.status_code == 200
-    # Bounded below the tail (no more rows) → immutable, cached without a
-    # revalidation round-trip.
-    assert historical.json()["has_more"] is False
-    cache_control = historical.headers.get("cache-control", "")
-    assert "immutable" in cache_control
-    assert "no-cache" not in cache_control
-
-
-async def test_list_session_items_etag_changes_when_tail_grows(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """A new committed item changes the tail ETag so a stale If-None-Match
-    no longer 304s — the client refetches the grown page."""
-    from omnigent.entities import MessageData, NewConversationItem
-
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"], initial_message="etag grow 1")
-    await _wait_for_idle(client, session["id"])
-
-    first = await client.get(f"/v1/sessions/{session['id']}/items")
-    etag_before = first.headers["etag"]
-
-    # Append another committed item directly through the store (no runner is
-    # bound in this harness), so the tail page grows by one row.
     store = SqlAlchemyConversationStore(db_uri)
     await asyncio.to_thread(
         store.append,
@@ -2768,19 +2714,43 @@ async def test_list_session_items_etag_changes_when_tail_grows(
         [
             NewConversationItem(
                 type="message",
-                response_id="resp_grow",
-                data=MessageData(role="user", content=[{"type": "input_text", "text": "grow 2"}]),
+                response_id="resp_etag_tail",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "tail changed"}],
+                ),
             )
         ],
     )
 
-    revalidated = await client.get(
+    changed = await client.get(
         f"/v1/sessions/{session['id']}/items",
-        headers={"If-None-Match": etag_before},
+        headers={"If-None-Match": etag},
     )
-    # Tail grew → validator no longer matches → full 200 with a new ETag.
-    assert revalidated.status_code == 200
-    assert revalidated.headers["etag"] != etag_before
+    assert changed.status_code == 200
+    assert changed.headers["etag"] != etag
+
+
+async def test_list_session_items_marks_history_immutable(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="etag history")
+    await _wait_for_idle(client, session["id"])
+
+    newest = await client.get(
+        f"/v1/sessions/{session['id']}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    cursor = newest.json()["last_id"]
+    history = await client.get(
+        f"/v1/sessions/{session['id']}/items",
+        params={"limit": 100, "order": "desc", "after": cursor},
+    )
+
+    assert history.status_code == 200
+    assert history.headers["cache-control"] == "private, max-age=86400, immutable"
+    assert "etag" in history.headers
 
 
 # ── GET /v1/sessions/{id} snapshot fields ────────────────

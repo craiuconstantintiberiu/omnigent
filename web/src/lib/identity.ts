@@ -153,7 +153,7 @@ export async function authenticatedFetch(
   ) {
     headers.set("X-Forwarded-Email", _currentUserId);
   }
-  // Bypass the browser HTTP cache for all API calls. Session
+  // Bypass the browser HTTP cache for API calls by default. Session
   // endpoints (GET /v1/sessions/{id}) carry volatile in-memory state
   // (pending_elicitations) that changes between fetches without any
   // URL change. Without no-store the browser may serve a stale
@@ -162,7 +162,7 @@ export async function authenticatedFetch(
   const res = await hostFetch(typeof input === "string" ? input : input.toString(), {
     ...init,
     headers,
-    cache: "no-store",
+    cache: init?.cache ?? "no-store",
   });
 
   if (
