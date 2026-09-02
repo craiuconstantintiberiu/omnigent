@@ -31,7 +31,7 @@ const ws = vi.hoisted(() => ({
   srcEntries: [] as unknown[],
   rootLoading: false,
   dirLoading: false,
-  rootQueryEnabled: [] as boolean[],
+  rootQueryEnabled: true,
 }));
 const ROOT_ENTRIES: WorkspaceFile[] = [
   { path: "src", name: "src", type: "directory", bytes: null, modified_at: null },
@@ -46,7 +46,7 @@ function resetWorkspaceMock() {
   ws.srcEntries = SRC_ENTRIES;
   ws.rootLoading = false;
   ws.dirLoading = false;
-  ws.rootQueryEnabled = [];
+  ws.rootQueryEnabled = true;
 }
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
@@ -56,7 +56,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
       _conversationId: string | undefined,
       options: { enabled?: boolean } = {},
     ) => {
-      ws.rootQueryEnabled.push(options.enabled ?? true);
+      ws.rootQueryEnabled = options.enabled ?? true;
       return {
         data: { available: true, data: ws.rootEntries },
         isLoading: ws.rootLoading,
@@ -245,13 +245,13 @@ describe("Composer @-file-mention browser (native sessions)", () => {
 
   it("loads the root directory only while an '@' mention is active", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
-    expect(ws.rootQueryEnabled.at(-1)).toBe(false);
+    expect(ws.rootQueryEnabled).toBe(false);
 
     type("@");
-    expect(ws.rootQueryEnabled.at(-1)).toBe(true);
+    expect(ws.rootQueryEnabled).toBe(true);
 
     type("@src ");
-    expect(ws.rootQueryEnabled.at(-1)).toBe(false);
+    expect(ws.rootQueryEnabled).toBe(false);
   });
 
   it("opens a folder to reveal nested files, then delivers the chosen file", () => {
