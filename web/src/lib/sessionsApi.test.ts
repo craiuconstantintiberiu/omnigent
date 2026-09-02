@@ -747,6 +747,7 @@ describe("fetchSessionItemsPage", () => {
     expect(String(fetchMock.mock.calls[0]![0])).toBe(
       `/v1/sessions/conv%20with%20space/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
     );
+    expect((fetchMock.mock.calls[0]![1] as RequestInit).cache).toBe("default");
   });
 
   it("pages backwards via an `after` cursor in descending order when olderThan is set", async () => {

@@ -207,6 +207,24 @@ describe("authenticatedFetch", () => {
     expect(init.method).toBe("DELETE");
     expect(init.signal).toBe(controller.signal);
   });
+
+  it("disables caching by default", async () => {
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+
+    await authenticatedFetch("/v1/sessions");
+
+    expect((fetchMock.mock.calls[0][1] as RequestInit).cache).toBe("no-store");
+  });
+
+  it("preserves an explicit cache mode", async () => {
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+
+    await authenticatedFetch("/v1/sessions/conv_1/items", { cache: "default" });
+
+    expect((fetchMock.mock.calls[0][1] as RequestInit).cache).toBe("default");
+  });
 });
 
 describe("getCurrentAuthorId", () => {
