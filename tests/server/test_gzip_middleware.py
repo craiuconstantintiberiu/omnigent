@@ -4,7 +4,7 @@ import httpx
 import pytest
 from fastapi import FastAPI, Request
 
-from omnigent.server.routes._gzip_route import StateAwareGZipMiddleware, skip_gzip
+from omnigent.server.routes._gzip_route import SelectiveGZipMiddleware, skip_gzip
 
 
 @pytest.mark.asyncio
@@ -30,7 +30,7 @@ async def test_range_request_is_not_gzipped(client: httpx.AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_handler_can_skip_application_gzip() -> None:
     app = FastAPI()
-    app.add_middleware(StateAwareGZipMiddleware, minimum_size=500)
+    app.add_middleware(SelectiveGZipMiddleware, minimum_size=500)
 
     @app.get("/_test/gzip-skip")
     async def gzip_skip(request: Request) -> dict[str, str]:

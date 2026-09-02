@@ -6,7 +6,7 @@ from collections.abc import Mapping
 
 from fastapi.routing import APIRoute
 from starlette.datastructures import Headers
-from starlette.middleware.gzip import GZipResponder
+from starlette.middleware.gzip import GZipMiddleware, GZipResponder
 from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -120,18 +120,8 @@ class _StateAwareGZipResponder(GZipResponder):
         await super().send_with_compression(message)
 
 
-class StateAwareGZipMiddleware:
+class SelectiveGZipMiddleware(GZipMiddleware):
     """Compress eligible HTTP responses."""
-
-    def __init__(
-        self,
-        app: ASGIApp,
-        minimum_size: int = GZIP_MINIMUM_SIZE,
-        compresslevel: int = GZIP_COMPRESSLEVEL,
-    ) -> None:
-        self.app = app
-        self.minimum_size = minimum_size
-        self.compresslevel = compresslevel
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -208,6 +198,6 @@ __all__ = [
     "GZIP_MINIMUM_SIZE",
     "SKIP_GZIP_STATE_KEY",
     "GZipFileContentRoute",
-    "StateAwareGZipMiddleware",
+    "SelectiveGZipMiddleware",
     "skip_gzip",
 ]

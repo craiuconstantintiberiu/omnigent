@@ -62,7 +62,7 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
-from omnigent.server.routes._gzip_route import StateAwareGZipMiddleware
+from omnigent.server.routes._gzip_route import SelectiveGZipMiddleware
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -1476,7 +1476,7 @@ def create_app(
     # outermost WS middleware — a forbidden origin is closed without even
     # reaching the metrics counter (which only counts on accept anyway).
     app.add_middleware(WebSocketOriginMiddleware)
-    app.add_middleware(StateAwareGZipMiddleware, minimum_size=_WEB_UI_GZIP_MINIMUM_SIZE)
+    app.add_middleware(SelectiveGZipMiddleware, minimum_size=_WEB_UI_GZIP_MINIMUM_SIZE)
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
     # request/route closure) the runner router so it can reach the bound
