@@ -593,7 +593,6 @@ export function FilesPanel({
             searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
             browseLocation={locationParam}
             onNavigateDir={navigateToChild}
-            scrollElementRef={scrollRef}
           />
         )}
       </section>

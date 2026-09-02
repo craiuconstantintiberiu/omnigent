@@ -883,21 +883,6 @@ describe("FilesPanel tree (Explore) search", () => {
     expect(screen.queryByText("App.tsx")).toBeNull();
   });
 
-  it("mounts only the visible root rows for a large directory", () => {
-    const directories = Array.from({ length: 200 }, (_, index) =>
-      directory(`folder-${index.toString().padStart(3, "0")}`),
-    );
-    const view = renderPanel({ conversationId: "conv_tree_virtual_root", files: directories });
-    const section = view.container.querySelector("section");
-    if (!section) throw new Error("scroll section not found");
-
-    const mountedRows = section.querySelectorAll("button[aria-expanded]");
-    expect(mountedRows.length).toBeGreaterThan(0);
-    expect(mountedRows.length).toBeLessThan(directories.length);
-    expect(screen.getByRole("button", { name: /folder-000\//i })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /folder-199\//i })).toBeNull();
-  });
-
   it("aligns content at the same indentation for sibling folders and files (VS Code style)", () => {
     // Regression test: the expand caret used to push folder content right
     // of file content, breaking the visible hierarchy. In the minimal VS Code

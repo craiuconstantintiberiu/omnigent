@@ -1,10 +1,5 @@
 import { ChevronRightIcon, FileIcon } from "lucide-react";
-import {
-  measureElement as measureVirtualElement,
-  observeElementRect,
-  useVirtualizer,
-} from "@tanstack/react-virtual";
-import { useCallback, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   RunnerOfflineError,
   type WorkspaceChangedFile,
@@ -32,7 +27,6 @@ import { useCursorTooltip } from "./useCursorTooltip";
 const INDENT_STEP = 16;
 const BASE_PAD = 8;
 const GUIDE_OFFSET = 7;
-const INITIAL_TREE_VIEWPORT_HEIGHT = 800;
 const indentFor = (depth: number) => depth * INDENT_STEP + BASE_PAD;
 
 // One vertical guide line per ancestor level; the row must be `relative`.
@@ -78,29 +72,6 @@ interface DirNode {
 }
 
 type TreeNode = FileNode | DirNode;
-
-interface TreeNodeRowSharedProps {
-  onFileSelect: (path: string) => void;
-  conversationId: string | undefined;
-  expandedPaths: Set<string>;
-  onTogglePath: (path: string) => void;
-  showHidden: boolean;
-  changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
-  dirtyDirMap: Map<string, WorkspaceChangedFile["status"]>;
-  sort: ChangedSort;
-  /** Absolute path currently browsed; node paths resolve against it. */
-  browseLocation: string;
-  /** Re-root onto a directory (double-click), path relative to the root. */
-  onNavigateDir?: (relativePath: string) => void;
-}
-
-interface TreeNodeRowProps extends TreeNodeRowSharedProps {
-  node: TreeNode;
-  depth: number;
-  virtualIndex?: number;
-  virtualStart?: number;
-  measureElement?: (element: HTMLLIElement | null) => void;
-}
 
 /** Project a tree node onto the shape the shared file comparator sorts by.
  *  Directories have a name and (when known) an mtime, but never a size. */
@@ -245,7 +216,6 @@ export function FolderTree({
   searchError = null,
   browseLocation = "",
   onNavigateDir,
-  scrollElementRef,
 }: {
   files: WorkspaceFile[] | undefined;
   isLoading: boolean;
@@ -286,7 +256,6 @@ export function FolderTree({
    * matching Finder; a single click still just expands in place.
    */
   onNavigateDir?: (relativePath: string) => void;
-  scrollElementRef?: RefObject<HTMLElement | null>;
 }) {
   // Initialise from the module-level cache so expanded state survives
   // unmount/remount (e.g. opening the FileViewer and navigating back).
@@ -451,93 +420,28 @@ export function FolderTree({
       </p>
     );
   }
-  const rowProps: TreeNodeRowSharedProps = {
-    onFileSelect,
-    conversationId,
-    expandedPaths,
-    onTogglePath: togglePath,
-    showHidden,
-    changedFileMap,
-    dirtyDirMap,
-    sort,
-    browseLocation,
-    onNavigateDir,
-  };
   return (
     <TooltipProvider>
-      <TreeRoot nodes={visibleTree} scrollElementRef={scrollElementRef} {...rowProps} />
-    </TooltipProvider>
-  );
-}
-
-function TreeRoot({
-  nodes,
-  scrollElementRef,
-  ...rowProps
-}: TreeNodeRowSharedProps & {
-  nodes: TreeNode[];
-  scrollElementRef?: RefObject<HTMLElement | null>;
-}) {
-  if (!scrollElementRef) {
-    return (
       <ul className="flex flex-col gap-0.5">
-        {nodes.map((node) => (
+        {visibleTree.map((node) => (
           <TreeNodeRow
             key={node.type === "file" ? node.file.path : node.path}
             node={node}
             depth={0}
-            {...rowProps}
+            onFileSelect={onFileSelect}
+            conversationId={conversationId}
+            expandedPaths={expandedPaths}
+            onTogglePath={togglePath}
+            showHidden={showHidden}
+            changedFileMap={changedFileMap}
+            dirtyDirMap={dirtyDirMap}
+            sort={sort}
+            browseLocation={browseLocation}
+            onNavigateDir={onNavigateDir}
           />
         ))}
       </ul>
-    );
-  }
-  return <VirtualTreeRoot nodes={nodes} scrollElementRef={scrollElementRef} {...rowProps} />;
-}
-
-function VirtualTreeRoot({
-  nodes,
-  scrollElementRef,
-  ...rowProps
-}: TreeNodeRowSharedProps & {
-  nodes: TreeNode[];
-  scrollElementRef: RefObject<HTMLElement | null>;
-}) {
-  const virtualizer = useVirtualizer<HTMLElement, HTMLLIElement>({
-    count: nodes.length,
-    estimateSize: () => 29,
-    getItemKey: (index) => {
-      const node = nodes[index];
-      return node.type === "file" ? node.file.path : node.path;
-    },
-    getScrollElement: () => scrollElementRef.current,
-    initialRect: { height: INITIAL_TREE_VIEWPORT_HEIGHT, width: 0 },
-    measureElement: (element, entry, instance) =>
-      measureVirtualElement(element, entry, instance) || 29,
-    observeElementRect: (instance, onChange) =>
-      observeElementRect(instance, (rect) =>
-        onChange({
-          ...rect,
-          height: rect.height || INITIAL_TREE_VIEWPORT_HEIGHT,
-        }),
-      ),
-    overscan: 8,
-  });
-
-  return (
-    <ul className="relative w-full" style={{ height: `${virtualizer.getTotalSize()}px` }}>
-      {virtualizer.getVirtualItems().map((item) => (
-        <TreeNodeRow
-          key={item.key}
-          node={nodes[item.index]}
-          depth={0}
-          virtualIndex={item.index}
-          virtualStart={item.start}
-          measureElement={virtualizer.measureElement}
-          {...rowProps}
-        />
-      ))}
-    </ul>
+    </TooltipProvider>
   );
 }
 
@@ -563,9 +467,6 @@ function FileRowItem({
   bytes,
   onFileSelect,
   conversationId,
-  virtualIndex,
-  virtualStart,
-  measureElement,
 }: {
   /** Canonical workspace-relative path, used for the download button and title. */
   path: string;
@@ -581,9 +482,6 @@ function FileRowItem({
   bytes: number | null;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
-  virtualIndex?: number;
-  virtualStart?: number;
-  measureElement?: (element: HTMLLIElement | null) => void;
 }) {
   const isDeleted = fileStatus === "deleted";
   const fileColorClass =
@@ -597,20 +495,7 @@ function FileRowItem({
   const { handlers, tooltip } = useCursorTooltip(path);
 
   return (
-    <li
-      ref={measureElement}
-      data-index={virtualIndex}
-      style={
-        virtualStart === undefined
-          ? undefined
-          : {
-              position: "absolute",
-              transform: `translateY(${virtualStart}px)`,
-              width: "100%",
-              paddingBottom: "2px",
-            }
-      }
-    >
+    <li>
       <div
         className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-1 pr-2 hover:bg-muted"
         style={{ paddingLeft: `${indentFor(depth)}px` }}
@@ -722,18 +607,12 @@ function TreeFileRow({
   onFileSelect,
   conversationId,
   fileStatus,
-  virtualIndex,
-  virtualStart,
-  measureElement,
 }: {
   node: FileNode;
   depth: number;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
   fileStatus: WorkspaceChangedFile["status"] | undefined;
-  virtualIndex?: number;
-  virtualStart?: number;
-  measureElement?: (element: HTMLLIElement | null) => void;
 }) {
   return (
     <FileRowItem
@@ -744,57 +623,68 @@ function TreeFileRow({
       bytes={node.file.bytes}
       onFileSelect={onFileSelect}
       conversationId={conversationId}
-      virtualIndex={virtualIndex}
-      virtualStart={virtualStart}
-      measureElement={measureElement}
     />
   );
 }
 
-interface DirectoryChildrenProps extends TreeNodeRowSharedProps {
-  rawChildNodes: TreeNode[];
-  isLoading: boolean;
+// ---------------------------------------------------------------------------
+// TreeNodeRow
+// ---------------------------------------------------------------------------
+
+interface TreeNodeRowProps {
+  node: TreeNode;
   depth: number;
+  onFileSelect: (path: string) => void;
+  conversationId: string | undefined;
+  expandedPaths: Set<string>;
+  onTogglePath: (path: string) => void;
+  showHidden: boolean;
+  changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
+  dirtyDirMap: Map<string, WorkspaceChangedFile["status"]>;
+  sort: ChangedSort;
+  /** Absolute path currently browsed; node paths resolve against it. */
+  browseLocation: string;
+  /** Re-root onto a directory (double-click), path relative to the root. */
+  onNavigateDir?: (relativePath: string) => void;
 }
 
 function DirectoryChildren({
-  rawChildNodes,
+  nodes,
   isLoading,
-  depth,
-  showHidden,
-  ...rowProps
-}: DirectoryChildrenProps) {
-  const childNodes = showHidden
-    ? rawChildNodes
-    : rawChildNodes.filter((node) => !node.name.startsWith("."));
+  row,
+}: {
+  nodes: TreeNode[];
+  isLoading: boolean;
+  row: TreeNodeRowProps;
+}) {
+  const childNodes = row.showHidden ? nodes : nodes.filter((node) => !node.name.startsWith("."));
 
   return (
     <ul className="flex flex-col gap-0.5">
       {isLoading && (
         <li
           className="relative py-1 pr-2 text-muted-foreground text-sm"
-          style={{ paddingLeft: `${indentFor(depth + 1)}px` }}
+          style={{ paddingLeft: `${indentFor(row.depth + 1)}px` }}
         >
-          <IndentGuides depth={depth + 1} />
+          <IndentGuides depth={row.depth + 1} />
           Loading…
         </li>
       )}
-      {!isLoading && childNodes.length === 0 && rawChildNodes.length > 0 && (
+      {!isLoading && childNodes.length === 0 && nodes.length > 0 && (
         <li
           className="relative py-1 pr-2 text-muted-foreground text-sm"
-          style={{ paddingLeft: `${indentFor(depth + 1)}px` }}
+          style={{ paddingLeft: `${indentFor(row.depth + 1)}px` }}
         >
-          <IndentGuides depth={depth + 1} />
+          <IndentGuides depth={row.depth + 1} />
           All files are hidden — click the eye icon to reveal them.
         </li>
       )}
       {childNodes.map((child) => (
         <TreeNodeRow
+          {...row}
           key={child.type === "file" ? child.file.path : child.path}
           node={child}
-          depth={depth + 1}
-          showHidden={showHidden}
-          {...rowProps}
+          depth={row.depth + 1}
         />
       ))}
     </ul>
@@ -802,18 +692,19 @@ function DirectoryChildren({
 }
 
 function LazyDirectoryChildren({
-  node,
-  ...props
-}: Omit<DirectoryChildrenProps, "rawChildNodes" | "isLoading"> & { node: DirNode }) {
+  row,
+}: {
+  row: Omit<TreeNodeRowProps, "node"> & { node: DirNode };
+}) {
   // Fetch children on demand when a lazy directory is expanded.
   const { data, isLoading } = useWorkspaceDirectory(
-    props.conversationId,
-    node.path,
-    props.browseLocation,
+    row.conversationId,
+    row.node.path,
+    row.browseLocation,
   );
 
   // The API returns one level at a time, so entries convert directly to tree nodes.
-  const rawChildNodes: TreeNode[] = data
+  const nodes: TreeNode[] = data
     ? data
         .map((file): TreeNode => {
           if (file.type === "directory") {
@@ -828,25 +719,16 @@ function LazyDirectoryChildren({
           }
           return { type: "file", name: file.name, file };
         })
-        .sort(compareTreeNodes(props.sort))
+        .sort(compareTreeNodes(row.sort))
     : [];
 
-  return <DirectoryChildren rawChildNodes={rawChildNodes} isLoading={isLoading} {...props} />;
+  return <DirectoryChildren nodes={nodes} isLoading={isLoading} row={row} />;
 }
 
-// ---------------------------------------------------------------------------
-// TreeNodeRow
-// ---------------------------------------------------------------------------
-
-function TreeNodeRow({
-  node,
-  depth,
-  virtualIndex,
-  virtualStart,
-  measureElement,
-  ...rowProps
-}: TreeNodeRowProps) {
+function TreeNodeRow(row: TreeNodeRowProps) {
   const {
+    node,
+    depth,
     onFileSelect,
     conversationId,
     expandedPaths,
@@ -854,7 +736,7 @@ function TreeNodeRow({
     changedFileMap,
     dirtyDirMap,
     onNavigateDir,
-  } = rowProps;
+  } = row;
   const open = node.type === "dir" && expandedPaths.has(node.path);
   const isLazyDir = node.type === "dir" && node.lazy === true;
 
@@ -866,9 +748,6 @@ function TreeNodeRow({
         onFileSelect={onFileSelect}
         conversationId={conversationId}
         fileStatus={changedFileMap.get(node.file.path)}
-        virtualIndex={virtualIndex}
-        virtualStart={virtualStart}
-        measureElement={measureElement}
       />
     );
   }
@@ -884,20 +763,7 @@ function TreeNodeRow({
           : undefined;
 
   return (
-    <li
-      ref={measureElement}
-      data-index={virtualIndex}
-      style={
-        virtualStart === undefined
-          ? undefined
-          : {
-              position: "absolute",
-              transform: `translateY(${virtualStart}px)`,
-              width: "100%",
-              paddingBottom: "2px",
-            }
-      }
-    >
+    <li>
       {/* The row is a div, not a button: the copy button below is a sibling of
           the toggle, and a button nested inside a button is invalid HTML. The
           toggle still spans everything up to the copy button, so the clickable
@@ -957,14 +823,9 @@ function TreeNodeRow({
       </div>
       {open &&
         (isLazyDir ? (
-          <LazyDirectoryChildren node={node} depth={depth} {...rowProps} />
+          <LazyDirectoryChildren row={{ ...row, node }} />
         ) : (
-          <DirectoryChildren
-            rawChildNodes={node.children}
-            isLoading={false}
-            depth={depth}
-            {...rowProps}
-          />
+          <DirectoryChildren nodes={node.children} isLoading={false} row={row} />
         ))}
     </li>
   );
