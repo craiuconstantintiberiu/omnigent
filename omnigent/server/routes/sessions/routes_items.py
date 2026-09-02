@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 
 from fastapi import (
     APIRouter,
@@ -58,9 +57,7 @@ def _items_etag(
     count: int,
     has_more: bool,
 ) -> str:
-    value = repr((first_id, last_id, count, has_more)).encode()
-    digest = hashlib.sha256(value).hexdigest()[:16]
-    return f'W/"{digest}"'
+    return f'W/"{first_id or ""}:{last_id or ""}:{count}:{int(has_more)}"'
 
 
 def _etag_matches(header: str | None, etag: str) -> bool:
