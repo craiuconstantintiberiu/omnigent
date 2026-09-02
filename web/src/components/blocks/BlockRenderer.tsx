@@ -74,7 +74,6 @@ const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
-  sessionId?: string;
   onRetryError?: (item: Extract<RenderItem, { kind: "error" }>) => Promise<void>;
   /**
    * Lifecycle of the turn this bubble renders (`Bubble.lifecycle`).
@@ -229,7 +228,6 @@ type ToolRunFragment =
 export function BlockRenderer({
   items,
   sessionStatus,
-  sessionId,
   turnLifecycle,
   workedForS,
   continued = false,
@@ -321,17 +319,12 @@ export function BlockRenderer({
     return (
       <>
         <TurnWorkedFold workedForS={workedForS} animateCollapse={animateCollapse}>
-          {renderSequence(process, { liveEdge: false, sessionId })}
+          {renderSequence(process, { liveEdge: false })}
         </TurnWorkedFold>
         {exempt.map(({ item, index }) =>
-          renderItem(item, index, false, false, false, onRetryError, sessionId),
+          renderItem(item, index, false, false, false, onRetryError),
         )}
-        {renderSequence(final, {
-          liveEdge: false,
-          indexBase: finalStart,
-          onRetryError,
-          sessionId,
-        })}
+        {renderSequence(final, { liveEdge: false, indexBase: finalStart, onRetryError })}
       </>
     );
   }
@@ -340,7 +333,6 @@ export function BlockRenderer({
     liveEdge: isTurnLive,
     suppressReasoningDuration: showsWorking,
     onRetryError,
-    sessionId,
   });
 }
 
@@ -353,13 +345,7 @@ export function BlockRenderer({
  */
 function renderSequence(
   items: RenderItem[],
-  {
-    liveEdge,
-    suppressReasoningDuration = false,
-    indexBase = 0,
-    onRetryError,
-    sessionId,
-  }: TurnSequenceOptions,
+  { liveEdge, suppressReasoningDuration = false, indexBase = 0, onRetryError }: TurnSequenceOptions,
 ): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
@@ -398,17 +384,15 @@ function renderSequence(
         // are nested (inside `ToolGroupSummary`).
         rendered.push(
           <div key={`tool-group-with-tail:${indexBase + runStart}`} className="space-y-1">
-            <ToolGroupSummary tools={group.tools} sessionId={sessionId} />
+            <ToolGroupSummary tools={group.tools} />
             {tail.map((fragment, idx) =>
-              renderToolRunFragment(fragment, indexBase + runStart, idx, sessionId),
+              renderToolRunFragment(fragment, indexBase + runStart, idx),
             )}
           </div>,
         );
       } else {
         for (let idx = 0; idx < fragments.length; idx += 1) {
-          rendered.push(
-            renderToolRunFragment(fragments[idx]!, indexBase + runStart, idx, sessionId),
-          );
+          rendered.push(renderToolRunFragment(fragments[idx]!, indexBase + runStart, idx));
         }
       }
       previousRenderedItemWasText = false;
@@ -424,7 +408,6 @@ function renderSequence(
         suppressReasoningDuration,
         followsText,
         onRetryError,
-        sessionId,
       ),
     );
     previousRenderedItemWasText = item.kind === "text";
@@ -438,7 +421,6 @@ interface TurnSequenceOptions {
   suppressReasoningDuration?: boolean;
   indexBase?: number;
   onRetryError?: BlockRendererProps["onRetryError"];
-  sessionId?: string;
 }
 
 interface TurnPartition {
@@ -711,26 +693,13 @@ function renderToolRunFragment(
   fragment: ToolRunFragment,
   runStart: number,
   fragmentIndex: number,
-  sessionId?: string,
 ): ReactNode {
   if (fragment.kind === "group") {
     return (
-      <ToolGroupSummary
-        key={`tool-group:${runStart}:${fragmentIndex}`}
-        tools={fragment.tools}
-        sessionId={sessionId}
-      />
+      <ToolGroupSummary key={`tool-group:${runStart}:${fragmentIndex}`} tools={fragment.tools} />
     );
   }
-  return renderItem(
-    fragment.tool,
-    runStart + fragment.index,
-    false,
-    false,
-    false,
-    undefined,
-    sessionId,
-  );
+  return renderItem(fragment.tool, runStart + fragment.index, false);
 }
 
 const ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
@@ -778,7 +747,6 @@ function renderItem(
   suppressReasoningDuration = false,
   followsText = false,
   onRetryError?: BlockRendererProps["onRetryError"],
-  sessionId?: string,
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -822,7 +790,6 @@ function renderItem(
           arguments={item.execution.arguments}
           output={item.output}
           outputTruncated={item.outputTruncated}
-          sessionId={sessionId}
           outputItemId={item.outputItemId}
           state={item.state}
           startedAt={item.startedAt}

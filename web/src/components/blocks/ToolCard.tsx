@@ -16,7 +16,15 @@ import {
   XCircleIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   CodeBlock,
   CodeBlockActions,
@@ -40,6 +48,7 @@ import { useFileViewer } from "@/shell/FileViewerContext";
 
 const OUTPUT_PREVIEW_LINE_LIMIT = 80;
 const OUTPUT_PREVIEW_CHAR_LIMIT = 12_000;
+export const ToolOutputSessionContext = createContext<string | undefined>(undefined);
 
 /**
  * Tools whose `args.path` field is a workspace file path that the user
@@ -162,7 +171,6 @@ interface ToolCardProps {
   /** Tool output, or null if not yet available / never produced. */
   output: string | null;
   outputTruncated?: boolean;
-  sessionId?: string;
   outputItemId?: string | null;
   state: ToolState;
   /** Seconds from the page's performance clock when the tool call rendered. */
@@ -178,23 +186,16 @@ export function ToolCard({
   arguments: args,
   output,
   outputTruncated = false,
-  sessionId,
   outputItemId,
   state,
   startedAt,
   duration,
 }: ToolCardProps) {
+  const sessionId = useContext(ToolOutputSessionContext);
   const title = useMemo(() => formatToolTitle(name, args, argsSummary), [name, args, argsSummary]);
   const inputJson = useMemo(() => JSON.stringify(args, null, 2), [args]);
   const elapsedDuration = useElapsedDuration(state === "input-available" ? startedAt : null);
   const displayDuration = duration ?? elapsedDuration;
-  const loadFullOutput = useMemo(
-    () =>
-      sessionId !== undefined && outputItemId != null
-        ? () => fetchSessionToolOutput(sessionId, outputItemId)
-        : undefined,
-    [outputItemId, sessionId],
-  );
 
   // When this is a file-path tool and we're inside AppShell, make the path
   // in the trigger row a clickable link that opens the FileViewer.
@@ -229,7 +230,8 @@ export function ToolCard({
           <OutputSection
             output={output}
             outputTruncated={outputTruncated}
-            loadFullOutput={loadFullOutput}
+            sessionId={sessionId}
+            outputItemId={outputItemId}
           />
         )}
         {output === null && state === "input-available" && (
@@ -251,13 +253,7 @@ export function ToolCard({
  * tools fold here: older tools once the visible tail of the most
  * recent ones has been peeled off.
  */
-export function ToolGroupSummary({
-  tools,
-  sessionId,
-}: {
-  tools: RenderItem[];
-  sessionId?: string;
-}) {
+export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
   const label = formatToolRunLabel(tools.map(toolRunCall));
   return (
     // Named `group/tool-summary` so this collapsible only rotates its
@@ -281,7 +277,6 @@ export function ToolGroupSummary({
                 arguments={item.execution.arguments}
                 output={item.output}
                 outputTruncated={item.outputTruncated}
-                sessionId={sessionId}
                 outputItemId={item.outputItemId}
                 state={item.state}
                 startedAt={item.startedAt}
@@ -442,67 +437,55 @@ function CodePanel({
 function OutputSection({
   output,
   outputTruncated,
-  loadFullOutput,
+  sessionId,
+  outputItemId,
 }: {
   output: string;
   outputTruncated: boolean;
-  loadFullOutput?: () => Promise<string>;
+  sessionId?: string;
+  outputItemId?: string | null;
 }) {
   const [isExpanded, setIsExpanded] = useState(false);
   const [fullOutput, setFullOutput] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const requestId = useRef(0);
   useEffect(() => {
-    requestId.current += 1;
     setIsExpanded(false);
     setFullOutput(null);
     setIsLoading(false);
     setLoadError(null);
-    return () => {
-      requestId.current += 1;
-    };
-  }, [loadFullOutput, output, outputTruncated]);
+  }, [output, outputItemId, outputTruncated, sessionId]);
 
   const visibleOutput = fullOutput ?? output;
   const formattedOutput = useMemo(() => prettyPrintIfJson(visibleOutput), [visibleOutput]);
+  const fullOutputPending = outputTruncated && fullOutput === null;
   const collapsedPreview = useMemo(() => getOutputPreview(formattedOutput), [formattedOutput]);
   const preview = useMemo(
     () => getOutputPreview(formattedOutput, isExpanded),
     [formattedOutput, isExpanded],
   );
-  const fullOutputPending = outputTruncated && fullOutput === null;
   const canExpand = collapsedPreview.isTruncated || fullOutputPending;
 
-  const toggleExpanded = useCallback(async () => {
-    if (isExpanded) {
-      setIsExpanded(false);
-      return;
-    }
+  const toggleExpanded = async () => {
     if (!fullOutputPending) {
-      setIsExpanded(true);
+      setIsExpanded((value) => !value);
       return;
     }
-    if (loadFullOutput === undefined) {
+    if (sessionId === undefined || outputItemId == null) {
       setLoadError("The complete output is unavailable.");
       return;
     }
-
-    const currentRequest = ++requestId.current;
     setIsLoading(true);
     setLoadError(null);
     try {
-      const loaded = await loadFullOutput();
-      if (currentRequest !== requestId.current) return;
-      setFullOutput(loaded);
+      setFullOutput(await fetchSessionToolOutput(sessionId, outputItemId));
       setIsExpanded(true);
     } catch (error) {
-      if (currentRequest !== requestId.current) return;
       setLoadError(error instanceof Error ? error.message : "Failed to load the complete output.");
     } finally {
-      if (currentRequest === requestId.current) setIsLoading(false);
+      setIsLoading(false);
     }
-  }, [fullOutputPending, isExpanded, loadFullOutput]);
+  };
 
   return (
     <div className="space-y-2">

@@ -59,6 +59,7 @@ import {
   FilePathAwareMessageResponse,
   rendersOnlyWorkedFold,
 } from "@/components/blocks/BlockRenderer";
+import { ToolOutputSessionContext } from "@/components/blocks/ToolCard";
 import {
   CompactionMarker,
   ErrorBanner,
@@ -3581,19 +3582,20 @@ function AssistantBubble({
             and stopped its click target short of the column. Keeping the
             cap lands the hairline where an answered turn's does. */}
         <MessageContent className={spansFullColumn || foldOnly ? "w-full" : undefined}>
-          <BlockRenderer
-            items={bubble.items}
-            sessionStatus={sessionStatus}
-            sessionId={conversationId ?? undefined}
-            turnLifecycle={bubble.lifecycle}
-            workedForS={bubble.workedForS}
-            continued={bubble.continued}
-            isLastAssistant={isLastAssistant}
-            hasPendingElicitation={hasPendingElicitation}
-            lastActivityAtS={bubble.lastActivityAtS}
-            showsWorking={showsWorking}
-            onRetryError={handleRetryError}
-          />
+          <ToolOutputSessionContext.Provider value={conversationId ?? undefined}>
+            <BlockRenderer
+              items={bubble.items}
+              sessionStatus={sessionStatus}
+              turnLifecycle={bubble.lifecycle}
+              workedForS={bubble.workedForS}
+              continued={bubble.continued}
+              isLastAssistant={isLastAssistant}
+              hasPendingElicitation={hasPendingElicitation}
+              lastActivityAtS={bubble.lastActivityAtS}
+              showsWorking={showsWorking}
+              onRetryError={handleRetryError}
+            />
+          </ToolOutputSessionContext.Provider>
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
           <p

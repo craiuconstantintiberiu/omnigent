@@ -4,7 +4,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { RenderItem } from "@/lib/renderItems";
-import { ToolCard, ToolGroupSummary, formatToolDuration, getOutputPreview } from "./ToolCard";
+import {
+  ToolCard,
+  ToolGroupSummary,
+  ToolOutputSessionContext,
+  formatToolDuration,
+  getOutputPreview,
+} from "./ToolCard";
 
 const fetchMock = vi.fn();
 
@@ -17,7 +23,13 @@ afterEach(() => {
 // Render helper: ToolCard reads a Tooltip (trigger title) so it needs the
 // TooltipProvider; createElement keeps this in a .ts file without JSX.
 function renderCard(props: Parameters<typeof ToolCard>[0]) {
-  return render(createElement(TooltipProvider, null, createElement(ToolCard, props)));
+  return render(
+    createElement(
+      ToolOutputSessionContext.Provider,
+      { value: "conv_1" },
+      createElement(TooltipProvider, null, createElement(ToolCard, props)),
+    ),
+  );
 }
 
 function toolOutputResponse(output: string): Response {
@@ -116,31 +128,7 @@ describe("ToolCard rendering", () => {
     expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
   });
 
-  it("loads a previewed output when it is expanded", async () => {
-    fetchMock.mockResolvedValueOnce(toolOutputResponse("complete output"));
-    vi.stubGlobal("fetch", fetchMock);
-    const { container } = renderCard({
-      name: "my_tool",
-      arguments: {},
-      output: "output prefix",
-      outputTruncated: true,
-      sessionId: "conv_1",
-      outputItemId: "fco_1",
-      state: "output-available",
-    });
-
-    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    expect(screen.getByText("output prefix")).toBeInTheDocument();
-    expect(fetchMock).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
-
-    await waitFor(() => expect(screen.getByText("complete output")).toBeInTheDocument());
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(String(fetchMock.mock.calls[0]![0])).toBe("/v1/sessions/conv_1/items/fco_1");
-  });
-
-  it("allows a failed full-output request to be retried", async () => {
+  it("loads a previewed output on demand and retries failures", async () => {
     fetchMock
       .mockRejectedValueOnce(new Error("network unavailable"))
       .mockResolvedValueOnce(toolOutputResponse("complete output"));
@@ -150,18 +138,21 @@ describe("ToolCard rendering", () => {
       arguments: {},
       output: "output prefix",
       outputTruncated: true,
-      sessionId: "conv_1",
       outputItemId: "fco_1",
       state: "output-available",
     });
 
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("output prefix")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+
     fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     await waitFor(() => expect(screen.getByText("network unavailable")).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     await waitFor(() => expect(screen.getByText("complete output")).toBeInTheDocument());
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1]![0])).toBe("/v1/sessions/conv_1/items/fco_1");
   });
 
   it("renders a pending output placeholder while input-available with no output", () => {
