@@ -13,7 +13,7 @@ from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary
 
 from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
@@ -27,18 +27,6 @@ from omnigent.db.query_context import query_name_scope
 from omnigent.entities import NewConversationItem
 
 _logger = logging.getLogger(__name__)
-
-
-def _sqlite_dbapi() -> Any:
-    try:
-        import pysqlite3
-
-        return pysqlite3
-    except ImportError:
-        import sqlite3
-
-        return sqlite3
-
 
 # A callable that returns a context manager yielding a Session.
 ManagedSessionMaker = Callable[[], AbstractContextManager[Session]]
@@ -249,7 +237,6 @@ def _create_engine(db_uri: str) -> Engine:
         # legacy single-thread restriction.
         engine = create_engine(
             db_uri,
-            module=_sqlite_dbapi(),
             connect_args={"check_same_thread": False, "timeout": 20.0},
             # Give SQLite a modest pool above SQLAlchemy's default
             # QueuePool(5, 10) = 15, which the /health sidebar poll exhausts
@@ -270,8 +257,10 @@ def _create_engine(db_uri: str) -> Engine:
         # benefit — the per-session PRAGMA in
         # :func:`make_managed_session_maker` only fires for code
         # paths that go through that helper.
+        import sqlite3
+
         @event.listens_for(engine, "connect")
-        def _set_sqlite_pragma(dbapi_conn: Any, _conn_record: object) -> None:
+        def _set_sqlite_pragma(dbapi_conn: sqlite3.Connection, _conn_record: object) -> None:
             cur = dbapi_conn.cursor()
             try:
                 cur.execute("PRAGMA journal_mode=WAL")
@@ -890,6 +879,19 @@ _CREATE_TRIGRAM_FTS = text(
     "workspace_id UNINDEXED, item_id UNINDEXED, conversation_id UNINDEXED, "
     "search_text, tokenize='trigram')"
 )
+_CREATE_TRIGRAM_FTS_INSERT = text(
+    f"CREATE TRIGGER IF NOT EXISTS {_TRIGRAM_FTS_TABLE}_insert "
+    "AFTER INSERT ON conversation_items BEGIN "
+    f"INSERT INTO {_TRIGRAM_FTS_TABLE} "
+    "(workspace_id, item_id, conversation_id, search_text) "
+    "VALUES (new.workspace_id, new.id, new.conversation_id, new.search_text); END"
+)
+_CREATE_TRIGRAM_FTS_DELETE = text(
+    f"CREATE TRIGGER IF NOT EXISTS {_TRIGRAM_FTS_TABLE}_delete "
+    "AFTER DELETE ON conversation_items BEGIN "
+    f"DELETE FROM {_TRIGRAM_FTS_TABLE} "
+    "WHERE workspace_id = old.workspace_id AND item_id = old.id; END"
+)
 
 # Dialects that support SQLite's FTS5 extension. Cloudflare D1 is SQLite
 # served over HTTP, so it gets full-text search too — gate FTS on the dialect
@@ -955,6 +957,8 @@ def ensure_fts_table(engine: Engine) -> None:
             conn.execute(_CREATE_FTS)
             if trigram_supported:
                 conn.execute(_CREATE_TRIGRAM_FTS)
+                conn.execute(_CREATE_TRIGRAM_FTS_INSERT)
+                conn.execute(_CREATE_TRIGRAM_FTS_DELETE)
                 if (
                     conn.execute(text(f"SELECT 1 FROM {_TRIGRAM_FTS_TABLE} LIMIT 1")).first()
                     is None
@@ -976,7 +980,7 @@ def insert_fts(
     search_text: str,
 ) -> None:
     """
-    Dual-write a row into the FTS5 tables (SQLite-family dialects only).
+    Dual-write a row into the FTS5 table (SQLite-family dialects only).
 
     On dialects without FTS5 this is a no-op.
 
@@ -989,7 +993,15 @@ def insert_fts(
     :param search_text: Plain-text content to store in the FTS
         index for this item.
     """
-    insert_fts_bulk(session, [(item_id, conversation_id, search_text)])
+    if session.bind and _supports_fts5(session.bind.dialect.name):
+        session.execute(
+            text(
+                f"INSERT INTO {_FTS_TABLE}"
+                "(item_id, conversation_id, search_text) "
+                "VALUES (:item_id, :cid, :st)"
+            ),
+            {"item_id": item_id, "cid": conversation_id, "st": search_text},
+        )
 
 
 def insert_fts_bulk(
@@ -997,7 +1009,7 @@ def insert_fts_bulk(
     rows: list[tuple[str, str, str]],
 ) -> None:
     """
-    Dual-write multiple rows into the FTS5 tables in batched INSERTs.
+    Dual-write multiple rows into the FTS5 table in a single INSERT.
 
     On dialects without FTS5 this is a no-op. An empty ``rows`` list is also
     a no-op.
@@ -1009,28 +1021,18 @@ def insert_fts_bulk(
         return
     if not (session.bind and _supports_fts5(session.bind.dialect.name)):
         return
-    from omnigent.db.db_models import current_workspace_id, uuid_to_bytes
-
-    trigram_supported = supports_trigram_fts(session.bind)
     # 3 params per row; keep total < 999 (SQLite's safe SQLITE_MAX_VARIABLE_NUMBER
     # on pre-3.32 builds). Newer SQLite raised the limit to 32766, but chunking at
     # 300 is safe on all versions.
-    chunk_size = 300
-    for chunk_start in range(0, len(rows), chunk_size):
-        chunk = rows[chunk_start : chunk_start + chunk_size]
+    _CHUNK_SIZE = 300
+    for chunk_start in range(0, len(rows), _CHUNK_SIZE):
+        chunk = rows[chunk_start : chunk_start + _CHUNK_SIZE]
         placeholders = ", ".join(f"(:item_id_{i}, :cid_{i}, :st_{i})" for i in range(len(chunk)))
-        params: dict[str, object] = {}
-        trigram_params: dict[str, object] = {}
-        if trigram_supported:
-            trigram_params["workspace_id"] = current_workspace_id()
+        params: dict[str, str] = {}
         for i, (item_id, conversation_id, search_text) in enumerate(chunk):
             params[f"item_id_{i}"] = item_id
             params[f"cid_{i}"] = conversation_id
             params[f"st_{i}"] = search_text
-            if trigram_supported:
-                trigram_params[f"item_id_{i}"] = uuid_to_bytes(item_id)
-                trigram_params[f"cid_{i}"] = uuid_to_bytes(conversation_id)
-                trigram_params[f"st_{i}"] = search_text
         session.execute(
             text(
                 f"INSERT INTO {_FTS_TABLE}"
@@ -1039,18 +1041,6 @@ def insert_fts_bulk(
             ),
             params,
         )
-        if trigram_supported:
-            trigram_placeholders = ", ".join(
-                f"(:workspace_id, :item_id_{i}, :cid_{i}, :st_{i})" for i in range(len(chunk))
-            )
-            session.execute(
-                text(
-                    f"INSERT INTO {_TRIGRAM_FTS_TABLE}"
-                    "(workspace_id, item_id, conversation_id, search_text) "
-                    f"VALUES {trigram_placeholders}"
-                ),
-                trigram_params,
-            )
 
 
 def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
@@ -1064,7 +1054,11 @@ def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
     :param conversation_id: The conversation whose FTS rows should be
         removed, e.g. ``"conv_e4f5a6b7..."``.
     """
-    delete_fts_by_conversation_ids(session, [conversation_id])
+    if session.bind and _supports_fts5(session.bind.dialect.name):
+        session.execute(
+            text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id = :cid"),
+            {"cid": conversation_id},
+        )
 
 
 def delete_fts_by_conversation_ids(session: Session, conv_ids: list[str]) -> None:
@@ -1079,27 +1073,12 @@ def delete_fts_by_conversation_ids(session: Session, conv_ids: list[str]) -> Non
     if not conv_ids:
         return
     if session.bind and _supports_fts5(session.bind.dialect.name):
-        from omnigent.db.db_models import current_workspace_id, uuid_to_bytes
-
         placeholders = ", ".join(f":cid{i}" for i in range(len(conv_ids)))
         params = {f"cid{i}": cid for i, cid in enumerate(conv_ids)}
         session.execute(
             text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id IN ({placeholders})"),
             params,
         )
-        if supports_trigram_fts(session.bind):
-            trigram_params: dict[str, object] = {
-                "workspace_id": current_workspace_id(),
-                **{f"cid{i}": uuid_to_bytes(cid) for i, cid in enumerate(conv_ids)},
-            }
-            session.execute(
-                text(
-                    f"DELETE FROM {_TRIGRAM_FTS_TABLE} "
-                    f"WHERE workspace_id = :workspace_id "
-                    f"AND conversation_id IN ({placeholders})"
-                ),
-                trigram_params,
-            )
 
 
 # ── Search text extraction ─────────────────────────────

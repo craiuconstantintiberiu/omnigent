@@ -101,11 +101,14 @@ from omnigent.stores.conversation_store import (
 _logger = logging.getLogger(__name__)
 
 # Server-side deadline (ms) for the content-search query in
-# ``list_conversations``. The PostgreSQL content path can scan large item
-# histories, and a client disconnect does not stop its worker thread.
-# ``SET LOCAL statement_timeout`` caps it instead of pinning a connection.
-# Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks to the
-# connection's next pooled use. Longer than the client's own
+# ``list_conversations``. Session search matches ``LOWER(search_text) LIKE
+# '%q%'`` across ``conversation_items``; that is index-backed by the pg_trgm
+# GIN index (migration ``d5e9f1a2b3c4``), but if the index is ever missing the
+# scan can run unbounded and — since the query runs in a worker thread — a
+# client disconnect does not stop it. ``SET LOCAL statement_timeout`` caps it so
+# a degraded deployment fails the search fast instead of pinning a DB
+# connection. Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks
+# to the connection's next pooled use. Longer than the client's own
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 _TRIGRAM_MIN_QUERY_CHARS = 3
