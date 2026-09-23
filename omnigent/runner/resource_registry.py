@@ -1565,8 +1565,8 @@ class SessionResourceRegistry:
     ) -> SessionStatusPoller:
         """Build the claude-native ``sessions/<pid>.json`` status poller.
 
-        Keyed primarily by the terminal's pane pid (which equals Claude's
-        pid on this launch path, so the file is ``<pane_pid>.json``), with
+        Keyed primarily by the terminal's pane pid or one of its
+        descendants (Claude's pid when a launch wrapper execs it), with
         Claude's own session uuid — read lazily from the bridge state once
         a hook reports it — as a cross-check and scan fallback.
 

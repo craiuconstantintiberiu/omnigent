@@ -26,6 +26,7 @@ watcher that consumes this treats an unresolved / unreadable file as
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -33,6 +34,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+import psutil  # type: ignore[import-untyped]
 
 _logger = logging.getLogger(__name__)
 
@@ -157,6 +160,25 @@ def _matches_session(
     return record.get("sessionId") == expected_session_id
 
 
+def _pane_process_pids(pane_pid: int | None) -> list[int]:
+    """Return the pane pid followed by its descendants' pids.
+
+    A launch wrapper (``env … isaac -- …`` and the processes it execs) sits
+    between the pane and ``claude``, so Claude's own pid — the one naming
+    its status file — is a descendant of the pane process, not the pane
+    process itself.
+
+    :param pane_pid: The tmux pane pid, or ``None`` when unknown.
+    :returns: Pids to try in order; empty when *pane_pid* is ``None``.
+    """
+    if pane_pid is None:
+        return []
+    pids = [pane_pid]
+    with contextlib.suppress(psutil.Error):
+        pids.extend(child.pid for child in psutil.Process(pane_pid).children(recursive=True))
+    return pids
+
+
 def resolve_status_file(
     *,
     pane_pid: int | None,
@@ -168,12 +190,12 @@ def resolve_status_file(
 
     Resolution order:
 
-    1. **Pid lookup** (``<pane_pid>.json``): on the omnigent launch path
-       tmux ``exec``s ``claude`` as the pane process, so the file's pid
-       equals ``#{pane_pid}``. This is the common O(1) case.
-    2. **SessionId scan**: if the pid file is absent or fails the
-       cross-check (e.g. a shell/sandbox wrapper sits between the pane and
-       ``claude``), scan recent files for a matching ``sessionId``. Only
+    1. **Pid lookup** (``<pane_pid>.json``, then each descendant's
+       ``<pid>.json``): when tmux ``exec``s ``claude`` as the pane process
+       the file's pid equals ``#{pane_pid}``; behind a launch wrapper it is
+       a descendant's pid.
+    2. **SessionId scan**: if no pid file matches the cross-check, scan
+       recent files for a matching ``sessionId``. Only
        runs when ``expected_session_id`` is known, bounded to files
        modified within :data:`_SCAN_FRESHNESS_WINDOW_S`.
 
@@ -188,8 +210,8 @@ def resolve_status_file(
     """
     directory = sessions_dir(config_dir)
 
-    if pane_pid is not None:
-        candidate = directory / f"{pane_pid}.json"
+    for pid in _pane_process_pids(pane_pid):
+        candidate = directory / f"{pid}.json"
         record = _read_json_file(candidate)
         if record is not None and _matches_session(
             record, expected_session_id=expected_session_id
@@ -252,13 +274,11 @@ def read_session_status(path: Path) -> SessionStatus | None:
     )
 
 
-# Attempts to resolve the file before giving up and leaving the PTY
-# watcher authoritative for the session's lifetime. At the claude-native
-# poll cadence (~0.2s) this is a few seconds — long enough for a booting
-# Claude to write its file and for the first hook to report the session
-# id, short enough that an old Claude (pre-v2.1.139, no file) or a broken
-# config dir falls back promptly without scanning forever.
-_MAX_RESOLVE_ATTEMPTS = 40
+# Attempts (~2 min at the 0.2s claude-native cadence) before the PTY watcher
+# owns status for the session's lifetime. A launch wrapper can delay Claude's
+# start past ten seconds; the PTY watcher still publishes meanwhile, so
+# waiting costs one resolution attempt per tick.
+_MAX_RESOLVE_ATTEMPTS = 600
 
 
 class SessionStatusPoller:
