@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from omnigent.harnesses.claude_native.status_file import (
+    _MAX_RESOLVE_ATTEMPTS,
     IDLE,
     RUNNING,
     SessionStatusPoller,
@@ -194,10 +195,35 @@ def test_poller_gives_up_when_file_never_appears(tmp_path: Path) -> None:
         config_dir=tmp_path,
     )
     # Drive well past the resolve-attempt cap.
-    for _ in range(60):
+    for _ in range(_MAX_RESOLVE_ATTEMPTS + 20):
         poller.tick()
     assert not poller.active
     assert published == []
+
+
+def test_poller_resolves_slow_wrapped_launch(tmp_path: Path) -> None:
+    """A Claude started late behind a wrapper (pane pid != Claude pid) resolves
+    by session id once its first hook reports it."""
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    hook_session_id: list[str | None] = [None]
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(100),
+        session_id_getter=lambda: hook_session_id[0],
+        config_dir=tmp_path,
+    )
+    for _ in range(50):  # ~10s of ticks before Claude is up
+        poller.tick()
+    assert not poller.active
+
+    _write_session_file(sessions, pid=103, session_id="s", status="idle")
+    hook_session_id[0] = "s"
+    poller.tick()
+
+    assert poller.active
+    assert published == [IDLE]
 
 
 def test_poller_deactivates_when_file_vanishes(tmp_path: Path) -> None:

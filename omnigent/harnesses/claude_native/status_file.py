@@ -252,13 +252,11 @@ def read_session_status(path: Path) -> SessionStatus | None:
     )
 
 
-# Attempts to resolve the file before giving up and leaving the PTY
-# watcher authoritative for the session's lifetime. At the claude-native
-# poll cadence (~0.2s) this is a few seconds — long enough for a booting
-# Claude to write its file and for the first hook to report the session
-# id, short enough that an old Claude (pre-v2.1.139, no file) or a broken
-# config dir falls back promptly without scanning forever.
-_MAX_RESOLVE_ATTEMPTS = 40
+# Attempts (~2 min at the 0.2s claude-native cadence) before the PTY watcher
+# owns status for the session's lifetime. A launch wrapper hides Claude's pid
+# and can delay its first hook past ten seconds; the PTY watcher still
+# publishes meanwhile, so waiting costs one ``stat`` per tick.
+_MAX_RESOLVE_ATTEMPTS = 600
 
 
 class SessionStatusPoller:
