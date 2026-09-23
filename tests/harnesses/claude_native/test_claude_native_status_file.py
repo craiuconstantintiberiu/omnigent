@@ -9,10 +9,16 @@ falls back to the PTY watcher when the file never appears or vanishes.
 from __future__ import annotations
 
 import json
+import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
+import psutil
+import pytest
+
 from omnigent.harnesses.claude_native.status_file import (
+    _MAX_RESOLVE_ATTEMPTS,
     IDLE,
     RUNNING,
     SessionStatusPoller,
@@ -116,6 +122,51 @@ def test_resolve_scan_skips_stale_files(tmp_path: Path) -> None:
     assert path is None
 
 
+@pytest.fixture
+def wrapped_process() -> Iterator[tuple[int, int]]:
+    """Run a wrapper shell whose child stands in for a wrapped Claude.
+
+    :returns: ``(wrapper_pid, child_pid)``.
+    """
+    wrapper = subprocess.Popen(["sh", "-c", "sleep 30; true"])
+    try:
+        deadline = time.monotonic() + 5
+        children: list[psutil.Process] = []
+        while not children and time.monotonic() < deadline:
+            children = psutil.Process(wrapper.pid).children(recursive=True)
+            time.sleep(0.01)
+        assert children, "wrapper never started its child"
+        yield wrapper.pid, children[0].pid
+    finally:
+        for child in psutil.Process(wrapper.pid).children(recursive=True):
+            child.kill()
+        wrapper.kill()
+        wrapper.wait()
+
+
+def test_resolve_finds_wrapped_claude_before_first_hook(
+    tmp_path: Path, wrapped_process: tuple[int, int]
+) -> None:
+    """Behind a launch wrapper the file is named by a descendant of the pane
+    process, and resolves before any hook reports the session id."""
+    wrapper_pid, child_pid = wrapped_process
+    _write_session_file(tmp_path / "sessions", pid=child_pid, session_id="sid", status="idle")
+    path = resolve_status_file(pane_pid=wrapper_pid, expected_session_id=None, config_dir=tmp_path)
+    assert path is not None and path.name == f"{child_pid}.json"
+
+
+def test_resolve_wrapped_claude_honors_session_cross_check(
+    tmp_path: Path, wrapped_process: tuple[int, int]
+) -> None:
+    """A descendant's file for a different session is not returned."""
+    wrapper_pid, child_pid = wrapped_process
+    _write_session_file(tmp_path / "sessions", pid=child_pid, session_id="other", status="idle")
+    path = resolve_status_file(
+        pane_pid=wrapper_pid, expected_session_id="mine", config_dir=tmp_path
+    )
+    assert path is None
+
+
 def test_resolve_missing_pid_no_session_returns_none(tmp_path: Path) -> None:
     """No pid file and no session id → nothing to resolve."""
     (tmp_path / "sessions").mkdir()
@@ -194,10 +245,35 @@ def test_poller_gives_up_when_file_never_appears(tmp_path: Path) -> None:
         config_dir=tmp_path,
     )
     # Drive well past the resolve-attempt cap.
-    for _ in range(60):
+    for _ in range(_MAX_RESOLVE_ATTEMPTS + 20):
         poller.tick()
     assert not poller.active
     assert published == []
+
+
+def test_poller_resolves_slow_wrapped_launch(tmp_path: Path) -> None:
+    """A Claude started late behind a wrapper (pane pid != Claude pid) resolves
+    by session id once its first hook reports it."""
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    hook_session_id: list[str | None] = [None]
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(100),
+        session_id_getter=lambda: hook_session_id[0],
+        config_dir=tmp_path,
+    )
+    for _ in range(50):  # ~10s of ticks before Claude is up
+        poller.tick()
+    assert not poller.active
+
+    _write_session_file(sessions, pid=103, session_id="s", status="idle")
+    hook_session_id[0] = "s"
+    poller.tick()
+
+    assert poller.active
+    assert published == [IDLE]
 
 
 def test_poller_deactivates_when_file_vanishes(tmp_path: Path) -> None:
