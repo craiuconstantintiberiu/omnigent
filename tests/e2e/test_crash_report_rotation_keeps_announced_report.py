@@ -81,9 +81,7 @@ def _seed_corrupt_config(config_home: Path) -> None:
     """Make the next ``omnigent setup`` crash: a hand-edited ``config.yaml``
     whose top level is a list raises an unhandled AttributeError."""
     config_home.mkdir(parents=True, exist_ok=True)
-    (config_home / "config.yaml").write_text(
-        "- oops\n- edited by hand\n", encoding="utf-8"
-    )
+    (config_home / "config.yaml").write_text("- oops\n- edited by hand\n", encoding="utf-8")
 
 
 def _seed_prior_reports(crashes_dir: Path, mtime_ns: int) -> None:
@@ -121,9 +119,7 @@ def _crash_real_cli(tmp_path: Path, extra_env: dict[str, str]) -> tuple[Path, st
         "expected `omnigent setup` to crash on the corrupted config "
         f"(exit 1), got exit {result.returncode}:\n{stderr}\n{result.stdout}"
     )
-    assert "ran into an issue" in stderr, (
-        f"crash screen missing from stderr:\n{stderr}"
-    )
+    assert "ran into an issue" in stderr, f"crash screen missing from stderr:\n{stderr}"
     match = re.search(r"A crash report was saved to:\s*(\S+\.md)", stderr)
     assert match, f"crash screen did not announce a report path:\n{stderr}"
     return Path(match.group(1)), stderr
@@ -147,12 +143,8 @@ def test_announced_crash_report_survives_rotation_with_tied_mtimes(
 
     site_dir = tmp_path / "sitepath"
     site_dir.mkdir()
-    (site_dir / "sitecustomize.py").write_text(
-        _COARSE_FS_SITECUSTOMIZE, encoding="utf-8"
-    )
-    pythonpath = os.pathsep.join(
-        p for p in (str(site_dir), os.environ.get("PYTHONPATH")) if p
-    )
+    (site_dir / "sitecustomize.py").write_text(_COARSE_FS_SITECUSTOMIZE, encoding="utf-8")
+    pythonpath = os.pathsep.join(p for p in (str(site_dir), os.environ.get("PYTHONPATH")) if p)
 
     report_path, stderr = _crash_real_cli(
         tmp_path,
