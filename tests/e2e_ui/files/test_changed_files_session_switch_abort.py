@@ -130,8 +130,7 @@ def test_session_switch_cancels_pending_changed_files_request(
     page.locator(f'a[href="/c/{session_b}"]').click()
     expect(page).to_have_url(f"{base_url}/c/{session_b}", timeout=30_000)
     assert page.evaluate("window.__documentLoadMarker") == load_marker, (
-        "session switch reloaded the document; the reproduction needs an "
-        "in-place SPA navigation"
+        "session switch reloaded the document; the reproduction needs an in-place SPA navigation"
     )
 
     def _session_a_outcomes() -> list[str]:
