@@ -166,9 +166,9 @@ def native_claude_handback_session(
 
 
 def _script_handback_journey(mock_url: str, nonce: str) -> list[str]:
-    """Queue every model reply the journey needs; return the parent's reply tokens in order."""
+    """Queue every model reply the journey needs; return the parent's reply markers in order."""
     reset_mock_llm(mock_url)
-    parent_tokens = [f"ast-{nonce}-{index}" for index in range(4)]
+    parent_replies = [f"ast-{nonce}-{index}" for index in range(4)]
     for stage, match in (("s1", _CLASSIFIER_STAGE1), ("s2", _CLASSIFIER_STAGE2)):
         configure_mock_llm(
             mock_url,
@@ -196,7 +196,7 @@ def _script_handback_journey(mock_url: str, nonce: str) -> list[str]:
                     }
                 ]
             },
-            *({"text": token} for token in parent_tokens),
+            *({"text": token} for token in parent_replies),
         ],
         key=f"parent-{nonce}",
         match=f"delegate-{nonce}",
@@ -220,7 +220,7 @@ def _script_handback_journey(mock_url: str, nonce: str) -> list[str]:
         match=f"worker-{nonce}",
     )
     set_fallback_mock_llm(mock_url, _AUTO_MODE_MODEL, "fallback-reply")
-    return parent_tokens
+    return parent_replies
 
 
 @pytest.mark.nightly
@@ -233,7 +233,7 @@ def test_subagent_handback_is_not_a_user_prompt(
     """A subagent's ``<agent-message>`` hand-back never renders as a person's message."""
     base_url, session_id = native_claude_handback_session
     nonce = uuid.uuid4().hex[:8]
-    parent_tokens = _script_handback_journey(mock_llm_server_url, nonce)
+    parent_replies = _script_handback_journey(mock_llm_server_url, nonce)
 
     page.goto(f"{base_url}/c/{session_id}")
     _open_terminal_view(page)
@@ -245,7 +245,7 @@ def test_subagent_handback_is_not_a_user_prompt(
     expect(page.locator(_USER, has_text=f"delegate-{nonce}")).to_have_count(1, timeout=30_000)
     # The parent answers three times: after launching the subagent, after the
     # hand-back arrives, and after the background-task notification.
-    expect(page.locator(_ASSISTANT, has_text=parent_tokens[2]).first).to_be_visible(
+    expect(page.locator(_ASSISTANT, has_text=parent_replies[2]).first).to_be_visible(
         timeout=_JOURNEY_TIMEOUT_MS
     )
     expect(page.locator(_WORKING)).to_have_count(0, timeout=_TERMINAL_READY_TIMEOUT_MS)
