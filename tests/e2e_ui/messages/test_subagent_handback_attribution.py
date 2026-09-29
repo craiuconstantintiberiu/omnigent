@@ -18,6 +18,7 @@ from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import (
     configure_mock_llm,
+    mock_llm_saw_user_text,
     reset_mock_llm,
     set_fallback_mock_llm,
 )
@@ -161,6 +162,11 @@ def test_subagent_handback_not_rendered_as_user_message(
     )
     expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
     _log.info("background flow settled (parent_done rendered)")
+    # Only a report the parent model actually received can be misattributed;
+    # the transcript is deliberately silent about it, so ask the mock.
+    assert mock_llm_saw_user_text(mock_llm_server_url, "<agent-message", handback_sentinel), (
+        "the worker's report never reached the parent model as a hand-back"
+    )
 
     expect(page.locator(_USER, has_text=handback_sentinel)).to_have_count(0)
     expect(page.locator(_USER, has_text=_HANDBACK_MARKER)).to_have_count(0)

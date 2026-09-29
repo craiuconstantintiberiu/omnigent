@@ -698,6 +698,28 @@ def reset_mock_llm(mock_url: str) -> None:
     resp.raise_for_status()
 
 
+def mock_llm_saw_user_text(mock_url: str, *fragments: str) -> bool:
+    """Whether one captured user-role message carries every *fragment*.
+
+    Proves the model received injected text, such as a subagent hand-back,
+    even when the Omnigent transcript deliberately does not mirror it.
+
+    :param mock_url: Mock server base URL.
+    :param fragments: Substrings that must all occur in the same user message.
+    :returns: ``True`` when such a message exists in the captured requests.
+    """
+    resp = httpx.get(f"{mock_url}/mock/requests", timeout=10.0)
+    resp.raise_for_status()
+    for request in resp.json().get("requests", []):
+        for message in request.get("messages") or []:
+            if message.get("role") != "user":
+                continue
+            text = json.dumps(message.get("content"), ensure_ascii=False)
+            if all(fragment in text for fragment in fragments):
+                return True
+    return False
+
+
 def seed_committed_items(session_id: str, items: list[Any]) -> None:
     """Append committed ``NewConversationItem``s straight into the store.
 
