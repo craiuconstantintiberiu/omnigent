@@ -385,10 +385,18 @@ _MODEL_PICKER_OPEN_HINT = "use this session only"
 # swallow one (same reasoning as ``_SUBMIT_RETRY_INTERVAL_S``). The spacing
 # also bounds a residual hazard: were a successful Escape's repaint to
 # outlast it, the stale frame would draw a retry onto the bare composer
-# (interrupting a turn). 0.75s dwarfs a TUI repaint, so that window is
-# accepted rather than confirmation-gated.
+# (interrupting a turn). The spacing must also exceed Claude Code's
+# double-Escape window: two Escapes 0.77s apart on the composer open the rewind
+# dialog (whose Enter restores a checkpoint), while 1.0s apart do not.
 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
-_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 0.75
+_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
+# What :func:`_occupying_surface` reports when no input box is drawn.
+_OVERLAY_SURFACE = "an overlay"
+# The dismissal every surface drawn over the input box advertises in its
+# footer ("Esc to cancel", "Esc to clear"). A screen without a composer that
+# lacks it is not such a surface — e.g. a launch wrapper's output before
+# Claude Code has drawn its input box — and an Escape cannot clear it.
+_ESCAPE_DISMISS_HINT = re.compile(r"\bEsc to \w")
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -5548,7 +5556,10 @@ def _restore_occupied_input(
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
-    in-flight turn. An empty (torn) capture means "unknown" and gets no
+    in-flight turn. A screen with no input box counts only when it
+    advertises Escape as its dismissal; before Claude Code draws its input
+    box the pane holds launcher output, which is left to the readiness
+    gate. An empty (torn) capture means "unknown" and gets no
     Escape, and a surface seen in a single frame is re-confirmed a poll
     later before an Escape is spent on it, so a repaint artifact cannot
     draw one. A swallowed Escape is re-sent while the surface remains,
@@ -5580,6 +5591,8 @@ def _restore_occupied_input(
             return
         surface = _occupying_surface(pane)
         if surface is None:
+            return
+        if surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane):
             return
         now = time.monotonic()
         if now >= deadline:
@@ -5634,7 +5647,7 @@ def _occupying_surface(pane: str) -> str | None:
         return "the prompt-history search"
     row = _composer_row(pane)
     if row is None:
-        return "an overlay"
+        return _OVERLAY_SURFACE
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return None
     return "shell mode"
