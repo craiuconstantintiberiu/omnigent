@@ -11,10 +11,14 @@ Events are injected via :func:`_inject`, which calls :meth:`record_change` on
 the registry so tests exercise the same code path as real tool calls.
 """
 
+import contextlib
 import logging
 import os
 import subprocess
+import sys
 import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -26,6 +30,7 @@ from omnigent.runtime.filesystem_registry import (
     _git_timeout_seconds,
     _normalize_path,
     _parse_git_porcelain_line,
+    _run_shared_git_status,
     _unquote_git_path,
     create_filesystem_registry,
 )
@@ -1581,3 +1586,195 @@ def test_git_list_tracked_files_never_runs_a_nested_repositorys_hooks(tmp_path: 
     assert reg.list_tracked_files("sub") == ["a.txt"]
     assert reg.list_tracked_files() == ["sub/a.txt", "top.txt"]
     assert not marker.exists(), "git discovered the nested repository and ran its hook"
+
+
+def _start_daemon(target: Callable[[], None]) -> threading.Thread:
+    """Start *target* on a daemon thread and return the thread."""
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread
+
+
+def _init_empty_repo(path: Path) -> None:
+    """Create a git repository at *path*."""
+    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True, env=_git_env())
+
+
+def _wait_until_blocked_on_lock(tasks: list[tuple[int, int]]) -> None:
+    """Block until every ``(pid, tid)`` in *tasks* sleeps waiting for a lock.
+
+    A thread blocked in ``flock`` reports a lock-wait kernel function such as
+    ``locks_lock_inode_wait`` in its ``wchan``.
+    """
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        waiting = 0
+        for pid, tid in tasks:
+            with contextlib.suppress(OSError):
+                if "lock" in Path(f"/proc/{pid}/task/{tid}/wchan").read_text():
+                    waiting += 1
+        if waiting == len(tasks):
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"callers {tasks} never blocked on the shared git-status lock")
+
+
+def _start_late_callers(count: int, target: Callable[[], None]) -> list[threading.Thread]:
+    """Start *count* threads running *target* and wait until each is blocked on the lock."""
+    tids: list[int] = []
+    tids_lock = threading.Lock()
+
+    def run() -> None:
+        with tids_lock:
+            tids.append(threading.get_native_id())
+        target()
+
+    threads = [_start_daemon(run) for _ in range(count)]
+    deadline = time.monotonic() + 5
+    while len(tids) < count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    _wait_until_blocked_on_lock([(os.getpid(), tid) for tid in tids])
+    return threads
+
+
+_requires_proc = pytest.mark.skipif(
+    not Path("/proc/self/task").exists(), reason="needs /proc to observe waiters"
+)
+
+
+@_requires_proc
+def test_shared_git_status_answers_late_callers_with_one_later_run(tmp_path: Path) -> None:
+    """Callers arriving during a run share one fresh run, never the older one."""
+    _init_empty_repo(tmp_path)
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls: list[int] = []
+
+    def run() -> tuple[bytes, bytes | None]:
+        calls.append(len(calls))
+        if len(calls) == 1:
+            first_started.set()
+            assert release_first.wait(5)
+        return (f"run-{len(calls)}".encode(), None)
+
+    def call(results: list[bytes]) -> None:
+        results.append(_run_shared_git_status(tmp_path, ("status",), run)[0])
+
+    first_results: list[bytes] = []
+    first = _start_daemon(lambda: call(first_results))
+    assert first_started.wait(5)
+    late_results: list[bytes] = []
+    late = _start_late_callers(5, lambda: call(late_results))
+    release_first.set()
+    for thread in [first, *late]:
+        thread.join(5)
+
+    assert first_results == [b"run-1"]
+    assert late_results == [b"run-2"] * 5
+    assert len(calls) == 2
+
+
+@_requires_proc
+def test_shared_git_status_waits_for_a_run_in_another_process(tmp_path: Path) -> None:
+    """A caller in another process that arrives mid-run runs again afterwards
+    instead of reusing the older result."""
+    _init_empty_repo(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def run() -> tuple[bytes, bytes | None]:
+        started.set()
+        assert release.wait(5)
+        return (b"parent", None)
+
+    parent = _start_daemon(lambda: _run_shared_git_status(tmp_path, ("status",), run))
+    assert started.wait(5)
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from pathlib import Path; "
+            "from omnigent.runtime.filesystem_registry import _run_shared_git_status; "
+            "out = _run_shared_git_status(Path(sys.argv[1]), ('status',), "
+            "lambda: (b'child', None)); print(out[0].decode())",
+            str(tmp_path),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    _wait_until_blocked_on_lock([(child.pid, child.pid)])
+    release.set()
+    parent.join(5)
+    stdout, _ = child.communicate(timeout=30)
+
+    assert stdout.strip() == "child"
+    assert _run_shared_git_status(tmp_path, ("status",), lambda: (b"later", None)) == (
+        b"later",
+        None,
+    )
+
+
+@_requires_proc
+def test_shared_git_status_shares_a_failure_with_its_callers(tmp_path: Path) -> None:
+    """Every caller answered by a failed run sees the failure."""
+    _init_empty_repo(tmp_path)
+    holding = threading.Event()
+    release = threading.Event()
+
+    def held() -> tuple[bytes, bytes | None]:
+        holding.set()
+        assert release.wait(5)
+        return (b"", None)
+
+    calls: list[int] = []
+
+    def failing() -> tuple[bytes, bytes | None]:
+        calls.append(1)
+        raise GitStatusUnavailable("git status timed out after 30.0s")
+
+    errors: list[str] = []
+
+    def call() -> None:
+        try:
+            _run_shared_git_status(tmp_path, ("status",), failing)
+        except GitStatusUnavailable as exc:
+            errors.append(exc.reason)
+
+    holder = _start_daemon(lambda: _run_shared_git_status(tmp_path, ("status",), held))
+    assert holding.wait(5)
+    late = _start_late_callers(3, call)
+    release.set()
+    for thread in [holder, *late]:
+        thread.join(5)
+
+    assert errors == ["git status timed out after 30.0s"] * 3
+    assert len(calls) == 1
+
+
+def test_changed_files_shared_across_workspaces_stay_workspace_relative(tmp_path: Path) -> None:
+    """Registries for different workspaces in one repo each get their own paths,
+    and a change made after a call is visible on the next call."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "tracked.py").write_text("one\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    (tmp_path / "sub" / "tracked.py").write_text("one\ntwo\n")
+    root_registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    sub_registry = GitFilesystemRegistry(watch_path=tmp_path / "sub", git_root=tmp_path)
+
+    assert [r["path"] for r in root_registry.list_changed_files("a", limit=10)] == [
+        "sub/tracked.py"
+    ]
+    [sub_record] = sub_registry.list_changed_files("b", limit=10)
+    assert sub_record["path"] == "tracked.py"
+    assert (sub_record["lines_added"], sub_record["lines_removed"]) == (1, 0)
+
+    (tmp_path / "sub" / "new.py").write_text("new\n")
+    assert sorted(r["path"] for r in sub_registry.list_changed_files("b", limit=10)) == [
+        "new.py",
+        "tracked.py",
+    ]
