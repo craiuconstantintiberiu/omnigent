@@ -26,13 +26,15 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fnmatch
+import hashlib
+import json
 import logging
 import os
 import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +125,143 @@ class GitStatusUnavailable(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+@dataclasses.dataclass(frozen=True)
+class _SharedGitStatus:
+    """A changed-files ``git status`` result as stored for other callers.
+
+    :param generation: Number of the run that produced it; see
+        :func:`_run_shared_git_status`.
+    :param output: ``(status stdout, numstat stdout or None)``, or ``None``
+        when the run failed.
+    :param error: The failure reason when the run failed.
+    """
+
+    generation: int
+    output: tuple[bytes, bytes | None] | None
+    error: str | None
+
+
+def _read_shared_generation(path: Path) -> int:
+    """Return the run number stored at *path*, or ``0`` when unreadable."""
+    try:
+        return int(path.read_text(encoding="ascii"))
+    except (OSError, ValueError):
+        return 0
+
+
+def _read_shared_git_status(path: Path) -> _SharedGitStatus | None:
+    """Read a result written by :func:`_write_shared_git_status`.
+
+    :returns: The result, or ``None`` when missing or malformed.
+    """
+    try:
+        raw = path.read_bytes()
+        header_bytes, body = raw.split(b"\n", 1)
+        header = json.loads(header_bytes)
+        generation = int(header["generation"])
+        error = header["error"]
+        if error is not None:
+            return _SharedGitStatus(generation=generation, output=None, error=str(error))
+        status_len = int(header["status_len"])
+        numstat_len = header["numstat_len"]
+        status = body[:status_len]
+        numstat = None if numstat_len is None else body[status_len : status_len + int(numstat_len)]
+        return _SharedGitStatus(generation=generation, output=(status, numstat), error=None)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_shared_git_status(path: Path, result: _SharedGitStatus) -> None:
+    """Atomically store *result* at *path* for other callers."""
+    status, numstat = result.output if result.output is not None else (b"", None)
+    header = {
+        "generation": result.generation,
+        "error": result.error,
+        "status_len": len(status),
+        "numstat_len": None if numstat is None else len(numstat),
+    }
+    _write_bytes_atomically(path, json.dumps(header).encode() + b"\n" + status + (numstat or b""))
+
+
+def _write_bytes_atomically(path: Path, data: bytes) -> None:
+    """Replace *path* with *data* so readers never see a partial file."""
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp_path.write_bytes(data)
+    os.replace(tmp_path, path)
+
+
+def _run_shared_git_status(
+    git_root: Path,
+    key: tuple[str, ...],
+    run: Callable[[], tuple[bytes, bytes | None]],
+) -> tuple[bytes, bytes | None]:
+    """Run *run* for *key*, sharing results among all processes on the repo.
+
+    Every session in a repository asks for the same working-tree state, and on
+    a large repository one ``git status`` takes seconds, so concurrent requests
+    from many runners used to pile up until all of them timed out. Runs for a
+    key are serialized with a lock file next to the repository's other
+    Omnigent lock, and each run stores its result for the callers queued
+    behind it. A caller reuses a stored result only when that run started
+    after the caller arrived, so a shared answer is never older than the
+    request: callers that arrive while a run is in flight are all answered by
+    the next one.
+
+    :param git_root: Repository root; its common git dir holds the files.
+    :param key: Identifies runs that produce the same output, e.g. the
+        ``git status`` argv.
+    :param run: Produces the output; raises :class:`GitStatusUnavailable` on
+        failure.
+    :returns: The output of a run that started after this call began.
+    :raises GitStatusUnavailable: When that run failed.
+    """
+    if fcntl is None:
+        return run()
+    digest = hashlib.sha256("\0".join(key).encode()).hexdigest()[:16]
+    base = _git_common_dir(git_root) / f"omnigent-changed-files-{digest}"
+    started_path = base.with_name(f"{base.name}.started")
+    result_path = base.with_name(f"{base.name}.result")
+    arrived_after = _read_shared_generation(started_path)
+    try:
+        fd = os.open(base.with_name(f"{base.name}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        _logger.debug("could not share changed-files git status for %s", git_root, exc_info=True)
+        return run()
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        shared = _read_shared_git_status(result_path)
+        if shared is not None and shared.generation > arrived_after:
+            if shared.error is not None:
+                raise GitStatusUnavailable(shared.error)
+            assert shared.output is not None
+            return shared.output
+        generation = max(
+            _read_shared_generation(started_path),
+            shared.generation if shared is not None else 0,
+        )
+        generation += 1
+        with contextlib.suppress(OSError):
+            _write_bytes_atomically(started_path, str(generation).encode("ascii"))
+        try:
+            output = run()
+        except GitStatusUnavailable as exc:
+            with contextlib.suppress(OSError):
+                _write_shared_git_status(
+                    result_path,
+                    _SharedGitStatus(generation=generation, output=None, error=exc.reason),
+                )
+            raise
+        with contextlib.suppress(OSError):
+            _write_shared_git_status(
+                result_path, _SharedGitStatus(generation=generation, output=output, error=None)
+            )
+        return output
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # Filename patterns for ephemeral process artifacts that should never appear in
@@ -1113,6 +1252,46 @@ class GitFilesystemRegistry(FilesystemRegistry):
         # ``_SKIP_DIRS`` root-level prune (kept below as a safety net).
         argv = ["git", "status", "--porcelain", "--untracked-files=all"]
         argv.extend(self._skip_dir_pathspecs())
+        status_stdout, numstat_stdout = _run_shared_git_status(
+            self._git_root,
+            tuple(argv),
+            lambda: (self._run_git_status(argv), self._run_git_numstat()),
+        )
+        numstat = self._parse_git_numstat(numstat_stdout)
+        records: list[dict[str, Any]] = []
+        for line in status_stdout.decode("utf-8", errors="replace").splitlines():
+            parsed = _parse_git_porcelain_line(line)
+            if parsed is None:
+                continue
+            git_path, operation = parsed
+            rel_path = self._git_to_rel(git_path)
+            if rel_path is None:
+                continue
+            if _is_ephemeral(rel_path):
+                continue
+            # Skip runner-internal and build directories (e.g. terminals/,
+            # node_modules/).  These are never agent-edited source files.
+            first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
+            if first_component in _SKIP_DIRS:
+                continue
+            # Counts come only from `git diff HEAD` (via numstat). Files git
+            # doesn't diff — untracked new files, binaries — get no counter.
+            counts = numstat.get(rel_path, (None, None))
+            records.append(self._make_record(rel_path, operation, counts))
+
+        # Search reuses this answer for untracked files instead of paying for
+        # its own ``git status``, which can take tens of seconds on a big repo.
+        self._last_changes = [r["path"] for r in records if r["status"] != "deleted"]
+        records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
+        return records[:limit]
+
+    def _run_git_status(self, argv: list[str]) -> bytes:
+        """Run the changed-files ``git status`` and return its stdout.
+
+        :param argv: The ``git status`` argv built by :meth:`list_changed_files`.
+        :returns: Raw porcelain output.
+        :raises GitStatusUnavailable: On timeout, spawn error, or non-zero exit.
+        """
         started = time.monotonic()
         try:
             result = subprocess.run(
@@ -1155,34 +1334,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
             raise GitStatusUnavailable(
                 f"git status exited {result.returncode}" + (f": {stderr}" if stderr else "")
             )
-
-        numstat = self._run_git_numstat()
-        records: list[dict[str, Any]] = []
-        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
-            parsed = _parse_git_porcelain_line(line)
-            if parsed is None:
-                continue
-            git_path, operation = parsed
-            rel_path = self._git_to_rel(git_path)
-            if rel_path is None:
-                continue
-            if _is_ephemeral(rel_path):
-                continue
-            # Skip runner-internal and build directories (e.g. terminals/,
-            # node_modules/).  These are never agent-edited source files.
-            first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
-            if first_component in _SKIP_DIRS:
-                continue
-            # Counts come only from `git diff HEAD` (via numstat). Files git
-            # doesn't diff — untracked new files, binaries — get no counter.
-            counts = numstat.get(rel_path, (None, None))
-            records.append(self._make_record(rel_path, operation, counts))
-
-        # Search reuses this answer for untracked files instead of paying for
-        # its own ``git status``, which can take tens of seconds on a big repo.
-        self._last_changes = [r["path"] for r in records if r["status"] != "deleted"]
-        records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
-        return records[:limit]
+        return result.stdout
 
     def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
@@ -1367,21 +1519,14 @@ class GitFilesystemRegistry(FilesystemRegistry):
             "lines_removed": removed,
         }
 
-    def _run_git_numstat(self) -> dict[str, tuple[int | None, int | None]]:
-        """Return per-file line counts from ``git diff --numstat HEAD``.
-
-        ``--no-renames`` splits a rename into two independent entries — a full
-        add on the destination path and a full delete on the old path — so the
-        paths line up with ``git status``'s destination-only entries rather than
-        an ``old -> new`` pair. (A pure rename therefore shows ``+N`` on the
-        moved file, not ``(None, None)``.) Binary files report ``-\\t-`` →
-        ``(None, None)``. Paths are keyed cwd-relative via :meth:`_git_to_rel`.
+    def _run_git_numstat(self) -> bytes | None:
+        """Return the raw output of ``git diff --numstat --no-renames HEAD``.
 
         Never raises: a numstat failure (timeout, spawn error, non-zero exit)
-        returns ``{}`` so the changed-files list still renders with counts
+        returns ``None`` so the changed-files list still renders with counts
         degraded to ``None``. This is the sole guard for numstat failures.
 
-        :returns: Map of cwd-relative path → ``(lines_added, lines_removed)``.
+        :returns: Raw numstat output, or ``None`` when git failed.
         """
         argv = ["git", "diff", "--numstat", "--no-renames", "HEAD"]
         try:
@@ -1398,11 +1543,28 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 self._git_root,
                 exc_info=True,
             )
-            return {}
+            return None
         if result.returncode != 0:
+            return None
+        return result.stdout
+
+    def _parse_git_numstat(self, stdout: bytes | None) -> dict[str, tuple[int | None, int | None]]:
+        """Return per-file line counts from :meth:`_run_git_numstat` output.
+
+        ``--no-renames`` splits a rename into two independent entries — a full
+        add on the destination path and a full delete on the old path — so the
+        paths line up with ``git status``'s destination-only entries rather than
+        an ``old -> new`` pair. (A pure rename therefore shows ``+N`` on the
+        moved file, not ``(None, None)``.) Binary files report ``-\\t-`` →
+        ``(None, None)``. Paths are keyed cwd-relative via :meth:`_git_to_rel`.
+
+        :param stdout: Raw numstat output, or ``None`` when git failed.
+        :returns: Map of cwd-relative path → ``(lines_added, lines_removed)``.
+        """
+        if stdout is None:
             return {}
         counts: dict[str, tuple[int | None, int | None]] = {}
-        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
             fields = line.split("\t")
             if len(fields) != 3:
                 continue
