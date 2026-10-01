@@ -9,6 +9,7 @@ falls back to the PTY watcher when the file never appears or vanishes.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -264,6 +265,31 @@ def test_unknown_status_clears_dedup_so_next_read_publishes(tmp_path: Path) -> N
     _write_session_file(sessions, pid=1, session_id="s", status="busy")
     poller.tick()
     assert published == [RUNNING, RUNNING]
+
+
+def test_rewrite_with_unchanged_mtime_publishes(tmp_path: Path) -> None:
+    """A rewrite inside one filesystem timestamp tick still publishes.
+
+    Back-to-back writes can share an mtime, and ``busy``/``idle`` have the
+    same length, so neither stat field reveals the change.
+    """
+    sessions = tmp_path / "sessions"
+    path = _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    first = path.stat()
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    assert published == [RUNNING]
+
+    _write_session_file(sessions, pid=1, session_id="s", status="idle")
+    os.utime(path, ns=(first.st_atime_ns, first.st_mtime_ns))
+    poller.tick()
+    assert published == [RUNNING, IDLE]
 
 
 def test_stale_busy_is_reported_as_written(tmp_path: Path) -> None:

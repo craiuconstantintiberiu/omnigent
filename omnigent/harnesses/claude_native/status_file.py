@@ -265,9 +265,10 @@ class SessionStatusPoller:
     """Per-tick reader that turns the status file into status edges.
 
     Owns the small amount of state the claude-native watcher needs across
-    ticks: the lazily-resolved file path, an mtime short-circuit so an
-    unchanged file costs one ``stat``, and edge-deduping so a status
-    callback fires only on ``running`` ⇄ ``idle`` transitions.
+    ticks: the lazily-resolved file path and edge-deduping so a status
+    callback fires only on ``running`` ⇄ ``idle`` transitions. The file is
+    re-read every tick: rewrites inside one filesystem timestamp tick leave
+    its mtime unchanged, and ``busy``/``idle`` have the same length.
 
     Lifecycle, all on the single watcher thread (no lock needed):
 
@@ -319,7 +320,6 @@ class SessionStatusPoller:
         self._path: Path | None = None
         self._attempts = 0
         self._exhausted = False
-        self._last_mtime: float | None = None
         self._last_edge: tuple[str, str | None] | None = None
         self._last_status: SessionStatus | None = None
 
@@ -337,8 +337,7 @@ class SessionStatusPoller:
     def tick(self) -> None:
         """Advance one poll: resolve if needed, then publish on change.
 
-        Safe to call every poll; a no-op once resolution is exhausted, and
-        an unchanged active file costs a single ``stat``.
+        Safe to call every poll; a no-op once resolution is exhausted.
         """
         if self._exhausted:
             return
@@ -403,7 +402,7 @@ class SessionStatusPoller:
         status moves. That is a problem when the *listener* restarts: a server
         recycle wipes its status cache, and the session would sit on a stale
         ``idle`` for the rest of the turn because every source believes it
-        already reported. Dropping the edge/mtime baselines makes the next tick
+        already reported. Dropping the edge baseline makes the next tick
         publish the file's current value verbatim.
 
         Keeps the resolved path and the attempt count — this re-asserts a
@@ -414,7 +413,6 @@ class SessionStatusPoller:
             self._path,
             extra={"session_id": self._omnigent_session_id},
         )
-        self._last_mtime = None
         self._last_edge = None
 
     @property
@@ -431,16 +429,11 @@ class SessionStatusPoller:
     def _read_and_publish(self) -> None:
         """Read the resolved file and fire the callback on a status change."""
         assert self._path is not None
-        try:
-            mtime = self._path.stat().st_mtime
-        except OSError:
+        if not self._path.exists():
             # File vanished (clean exit unlinks it, or a crash). Exit
             # detection rides the PTY watcher, so just stop polling.
             self._exhausted = True
             return
-        if self._last_mtime is not None and mtime == self._last_mtime:
-            return
-        self._last_mtime = mtime
         status = read_session_status(self._path)
         if status is None:
             # An unrecognized literal — the file is an undocumented internal
