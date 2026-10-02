@@ -435,6 +435,202 @@ async def test_subagent_watcher_defers_a_spawn_owned_by_two_transcripts(
     assert "no resolved parent" in caplog.text
 
 
+def _spawn_record(uuid: str, *tool_use_ids: str, sidechain: bool) -> dict[str, Any]:
+    """Build an assistant record that spawns one sub-agent per tool-use id.
+
+    :param uuid: Record uuid.
+    :param tool_use_ids: Spawn ``Agent`` tool-use ids, in message order.
+    :param sidechain: Whether the record belongs to a sub-agent transcript.
+    :returns: Decoded transcript record.
+    """
+    return {
+        "isSidechain": sidechain,
+        "type": "assistant",
+        "uuid": uuid,
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": tool_use_id, "name": "Agent", "input": {}}
+                for tool_use_id in tool_use_ids
+            ],
+        },
+    }
+
+
+def _write_fork_subagent(
+    subagents_dir: Path,
+    *,
+    subagent_id: str,
+    tool_use_id: str,
+    records: list[dict[str, Any]],
+) -> None:
+    """Write the ``.meta.json`` + ``.jsonl`` pair of a fork sub-agent.
+
+    :param subagents_dir: The parent session's ``subagents/`` directory.
+    :param subagent_id: Claude-side sub-agent id.
+    :param tool_use_id: Tool-use id of the spawn, as stamped into the meta.
+    :param records: Decoded transcript records, inherited prefix included.
+    """
+    subagents_dir.mkdir(parents=True, exist_ok=True)
+    (subagents_dir / f"agent-{subagent_id}.meta.json").write_text(
+        json.dumps({"agentType": "fork", "description": subagent_id, "toolUseId": tool_use_id}),
+        encoding="utf-8",
+    )
+    (subagents_dir / f"agent-{subagent_id}.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+async def _register_subagents(
+    transcript_path: Path,
+    bridge_dir: Path,
+) -> tuple[dict[str, str], forwarder.SubagentForwardState]:
+    """Run one discovery pass and record where each start was posted.
+
+    :param transcript_path: Root Claude transcript.
+    :param bridge_dir: Native Claude bridge directory.
+    :returns: ``subagent_id`` → start request path, and the resulting state.
+    """
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if isinstance(body, list):
+            # Child transcript items are posted as a batch with one ack per item.
+            return httpx.Response(
+                202, json=[{"item_id": f"item_{index}"} for index in range(len(body))]
+            )
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+    return start_paths, state
+
+
+async def test_subagent_watcher_registers_forks_whose_transcripts_copy_their_spawn(
+    tmp_path: Path,
+) -> None:
+    """Forks spawned together from the root register under the root.
+
+    A fork's transcript opens with a ``fork-context-ref`` and a copy of the
+    parent message that spawned it, so the spawn id, and any sibling spawned in
+    the same message, also appears in the fork's own transcript. That copy
+    belongs to the parent and must not make the spawns ambiguous.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    spawn = _spawn_record("root-spawn", "toolu_fork_a", "toolu_fork_b", sidechain=False)
+    transcript_path.write_text(json.dumps(spawn) + "\n", encoding="utf-8")
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    for subagent_id, tool_use_id in (("fork-a", "toolu_fork_a"), ("fork-b", "toolu_fork_b")):
+        _write_fork_subagent(
+            subagents_dir,
+            subagent_id=subagent_id,
+            tool_use_id=tool_use_id,
+            records=[
+                {"type": "fork-context-ref", "agentId": subagent_id},
+                {**spawn, "isSidechain": True, "uuid": f"{subagent_id}-copy", "parentUuid": None},
+                {
+                    "isSidechain": True,
+                    "type": "user",
+                    "uuid": f"{subagent_id}-directive",
+                    "message": {"role": "user", "content": "You are a worker fork."},
+                },
+            ],
+        )
+
+    start_paths, state = await _register_subagents(transcript_path, bridge_dir)
+
+    assert start_paths == {
+        "fork-a": "/v1/sessions/conv_root/events",
+        "fork-b": "/v1/sessions/conv_root/events",
+    }
+    assert state.subagents["fork-a"].parent_subagent_id is None
+    assert state.subagents["fork-b"].parent_subagent_id is None
+
+
+async def test_subagent_watcher_registers_a_nested_fork_under_the_agent_that_forked(
+    tmp_path: Path,
+) -> None:
+    """A fork of a sub-agent inherits that sub-agent's spawns without owning them.
+
+    A nested fork's transcript copies its parent's history, including spawns the
+    parent made earlier, before the copied record that spawned the fork. Only
+    spawns after that record are the fork's own.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    parent_records = [
+        _spawn_record("worker-spawn", "toolu_worker", sidechain=True),
+        _spawn_record("fork-spawn", "toolu_fork", sidechain=True),
+    ]
+    parent_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="parent",
+        agent_type="general-purpose",
+        description="parent worker",
+        tool_use_id="toolu_parent",
+        transcript_records=parent_records,
+    )
+    subagents_dir = parent_transcript.parent
+    _write_fork_subagent(
+        subagents_dir,
+        subagent_id="worker",
+        tool_use_id="toolu_worker",
+        records=[],
+    )
+    _write_fork_subagent(
+        subagents_dir,
+        subagent_id="fork",
+        tool_use_id="toolu_fork",
+        records=[
+            parent_records[0],
+            {**parent_records[1], "uuid": "fork-spawn-copy"},
+            _spawn_record("grandchild-spawn", "toolu_grandchild", sidechain=True),
+        ],
+    )
+    _write_fork_subagent(
+        subagents_dir,
+        subagent_id="grandchild",
+        tool_use_id="toolu_grandchild",
+        records=[],
+    )
+
+    start_paths, state = await _register_subagents(transcript_path, bridge_dir)
+
+    assert start_paths == {
+        "parent": "/v1/sessions/conv_root/events",
+        "worker": "/v1/sessions/conv_parent/events",
+        "fork": "/v1/sessions/conv_parent/events",
+        "grandchild": "/v1/sessions/conv_fork/events",
+    }
+    assert state.subagents["worker"].parent_subagent_id == "parent"
+    assert state.subagents["fork"].parent_subagent_id == "parent"
+    assert state.subagents["grandchild"].parent_subagent_id == "fork"
+
+
 async def test_subagent_watcher_defers_and_logs_when_no_transcript_owns_the_spawn(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

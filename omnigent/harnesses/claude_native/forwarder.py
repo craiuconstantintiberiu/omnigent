@@ -2396,15 +2396,23 @@ def _tool_use_ids_in_transcript(
     transcript_path: Path,
     *,
     include_sidechains: bool,
+    own_spawn_tool_use_id: str | None = None,
 ) -> set[str]:
     """Return assistant tool-use ids from a Claude transcript.
 
     A partial trailing record is ignored because Claude may still be writing it;
     the next watcher poll reads the completed record.
 
+    A fork sub-agent's transcript opens with context copied from its parent,
+    ending with the parent record that spawned it. Those spawns belong to the
+    parent, so everything up to and including the record holding
+    ``own_spawn_tool_use_id`` is discarded.
+
     :param transcript_path: Claude JSONL transcript to inspect.
     :param include_sidechains: Whether records mirrored from child agents
         belong to this transcript owner.
+    :param own_spawn_tool_use_id: Tool-use id that spawned this transcript's
+        owner, or ``None`` for the root transcript.
     :returns: Tool-use ids owned by this transcript.
     """
     try:
@@ -2430,6 +2438,7 @@ def _tool_use_ids_in_transcript(
         content = message.get("content")
         if not isinstance(content, list):
             continue
+        record_tool_use_ids: set[str] = set()
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
@@ -2440,7 +2449,13 @@ def _tool_use_ids_in_transcript(
                 continue
             tool_use_id = block.get("id")
             if isinstance(tool_use_id, str) and tool_use_id:
-                tool_use_ids.add(tool_use_id)
+                record_tool_use_ids.add(tool_use_id)
+        if own_spawn_tool_use_id is not None and own_spawn_tool_use_id in record_tool_use_ids:
+            # The whole record is the parent's, including sibling spawns made
+            # in the same message.
+            tool_use_ids.clear()
+            continue
+        tool_use_ids |= record_tool_use_ids
     return tool_use_ids
 
 
@@ -2464,9 +2479,15 @@ def _subagent_parents_by_tool_use(
         for path in sorted(subagents_dir.glob("agent-*.jsonl"))
     )
     for path, owner_id in transcript_owners:
+        own_meta = (
+            None
+            if owner_id is None
+            else _read_subagent_meta(path.with_name(f"agent-{owner_id}.meta.json"))
+        )
         for tool_use_id in _tool_use_ids_in_transcript(
             path,
             include_sidechains=owner_id is not None,
+            own_spawn_tool_use_id=None if own_meta is None else own_meta["toolUseId"],
         ):
             if tool_use_id in owners and owners[tool_use_id] != owner_id:
                 ambiguous.add(tool_use_id)
