@@ -396,7 +396,7 @@ _OVERLAY_SURFACE = "an overlay"
 # footer ("Esc to cancel", "Esc to clear"). A screen without a composer that
 # lacks it is not such a surface — e.g. a launch wrapper's output before
 # Claude Code has drawn its input box — and an Escape cannot clear it.
-_ESCAPE_DISMISS_HINT = re.compile(r"\bEsc to \w")
+_ESCAPE_DISMISS_HINT = re.compile(r"\bEsc to \w", re.IGNORECASE)
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -5594,6 +5594,7 @@ def _restore_occupied_input(
     deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
     last_escape: float | None = None
     confirmed = False
+    unclearable_seen = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
@@ -5617,22 +5618,26 @@ def _restore_occupied_input(
                 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S,
             )
             return surface
+        # Nothing an Escape can clear: launcher output before the input box
+        # mounts, or a dialog that offers no dismissal.
+        unclearable = surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane)
         if not confirmed:
-            # One sighting is not enough to spend an Escape on — or to give a
-            # surface up as unclearable: on a bare composer Escape interrupts
-            # the running turn, and a single frame can misreport during a
-            # repaint. A real surface is still there a poll later; a repaint
-            # artifact is not.
+            # One sighting is not enough to spend an Escape on: on a bare
+            # composer Escape interrupts the running turn, and a single frame
+            # can misreport during a repaint. A real surface is still there a
+            # poll later; a repaint artifact is not.
             confirmed = True
-        elif surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane):
-            # Nothing an Escape can clear: launcher output before the input
-            # box mounts, or a dialog that offers no dismissal. Hand it back
-            # rather than spend Escapes that reach the composer later.
-            return surface
+        elif unclearable:
+            # Give it up only on two consecutive hint-less sightings, so a
+            # torn frame mid-redraw of a dismissible surface does not hand a
+            # transient back to a caller that will refuse to type into it.
+            if unclearable_seen:
+                return surface
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             _logger.info("claude-native: dismissing %s covering the input box", surface)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             last_escape = now
+        unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 

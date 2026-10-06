@@ -11180,6 +11180,57 @@ def test_inject_slash_command_fails_loud_when_dismissal_is_exhausted(
     assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
 
 
+def test_a_torn_frame_after_a_hinted_surface_does_not_refuse_the_slash_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One hint-less frame right after a dismissible surface is not a refusal.
+
+    A repaint caught mid-redraw can show neither the composer nor the
+    surface's footer. Giving the pane up on that single frame would fail the
+    slash command loud at a surface that was about to clear; the hint-less
+    read must be seen twice in a row before it counts.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _MODEL_PICKER_PANE,
+            "● Working on it",
+            _IDLE_PANE,
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter"]
+
+
+def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Footer casing is not reliable (see ``_DIALOG_FOOTER_RE``): ``esc to`` counts.
+
+    A dismissible surface read as unclearable would be refused instead of
+    cleared, so the hint check must not depend on the capital E.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _MODEL_PICKER_PANE.replace("Esc to cancel", "esc to cancel")
+    sends = _fake_tmux(
+        monkeypatch,
+        [pane, pane, _IDLE_PANE, _composer_pane("/compact"), _IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert [args[-1] for args in sends] == ["Escape", "C-u", "/compact", "Enter"]
+
+
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
