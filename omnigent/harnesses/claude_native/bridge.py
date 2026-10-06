@@ -4535,10 +4535,7 @@ def inject_slash_command(
     # composer would swallow the C-u and the typed command.
     surface = _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
     if surface is not None:
-        # Unlike inject_user_message there is no readiness gate below to
-        # catch this: nothing would draft, so the blind submit Enter would
-        # answer whatever holds the pane (a dialog's highlighted option)
-        # while this call reported success.
+        # No readiness gate follows; a blind Enter would answer the dialog.
         raise ClaudeTerminalDialog(
             f"Claude Code's input box is occupied by {surface}, so the command was "
             "not sent. Open the terminal, dismiss it, then retry."

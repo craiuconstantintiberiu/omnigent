@@ -11158,6 +11158,28 @@ def test_inject_slash_command_fails_loud_at_a_surface_escape_cannot_clear(
     assert sends == [], f"Nothing may be typed into the dialog; got {sends}."
 
 
+def test_inject_slash_command_fails_loud_when_dismissal_is_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A surface that outlives the dismissal retries gets no command either.
+
+    The picker advertises Escape and takes each one, yet never leaves; the
+    restore gives up at :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` and hands
+    the surface back. Only the dismissal Escapes may reach the pane — not
+    the ``C-u``, the command text, or the Enter that used to follow blind.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE])
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by an overlay"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    tails = [args[-1] for args in sends]
+    assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
+
+
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
