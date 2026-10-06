@@ -11072,8 +11072,11 @@ def test_occupied_input_retries_stay_outside_the_double_escape_window(
 
     Two Escapes 0.77s apart on Claude Code's composer open the rewind
     dialog; 1.0s apart they do not. A retry that lands after the first
-    Escape already cleared the surface must not form that pair.
+    Escape already cleared the surface must not form that pair. Runs on
+    :class:`_VirtualClock`, so the spacing under test is the production
+    constant rather than wall-clock scheduling.
     """
+    clock = _VirtualClock()
     escape_times: list[float] = []
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -11089,10 +11092,11 @@ def test_occupied_input_retries_stay_outside_the_double_escape_window(
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=_MODEL_PICKER_PANE, stderr="")
         if cmd[-1] == "Escape":
-            escape_times.append(time.monotonic())
+            escape_times.append(clock.monotonic())
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
     claude_native_bridge._restore_occupied_input("/tmp/example/tmux.sock", "claude:0.0")
 
     gaps = [later - earlier for earlier, later in itertools.pairwise(escape_times)]
@@ -11128,6 +11132,30 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     assert [args[-1] for args in sends] == ["Escape", "C-u", "/effort high", "Enter"]
+
+
+def test_inject_slash_command_fails_loud_at_a_surface_escape_cannot_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A composer-less dialog with no Escape hint gets no keystrokes at all.
+
+    The restore leaves such a surface alone (an Escape would not clear it,
+    and one spent on launcher output reaches the composer later), and a
+    slash command has no readiness gate behind it: nothing would draft, so
+    the blind submit Enter would accept the dialog's highlighted option
+    instead of running the command, while the call reported success. The
+    ``/effort`` confirmation shows the shape — the pending-user-prompt
+    guard does not recognize it as a decision prompt either.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_EFFORT_DIALOG_PANE])
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by an overlay"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert sends == [], f"Nothing may be typed into the dialog; got {sends}."
 
 
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(

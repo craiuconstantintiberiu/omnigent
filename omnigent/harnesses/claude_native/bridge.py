@@ -4487,7 +4487,10 @@ def inject_slash_command(
     Anything the person left occupying the composer from the embedded
     terminal (ctrl+r history search, rewind dialog, ``!`` shell mode) is
     dismissed first — see :func:`_restore_occupied_input` — so the
-    command cannot be typed into it.
+    command cannot be typed into it. A surface that stays (a dialog with
+    no Escape dismissal, or one that outlived the retries) fails the call
+    instead: nothing would draft, so the submit Enter would answer the
+    dialog rather than run the command.
 
     :param bridge_dir: Bridge directory path, e.g.
         ``/tmp/omnigent/claude-native/<digest>``.
@@ -4509,6 +4512,9 @@ def inject_slash_command(
     :raises ValueError: If *command* is empty, does not start with
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
+    :raises ClaudeTerminalDialog: If a surface still covers the input box
+        after the restore; no keystroke was sent. The person clears it from
+        the embedded terminal and retries.
     :raises RuntimeError: If the tmux target is not advertised in
         time, if a ``tmux send-keys`` invocation fails, or if the typed
         command verifiably never left the input box (submit swallowed).
@@ -4527,7 +4533,16 @@ def inject_slash_command(
     tmux_target = info["tmux_target"]
     # Same reclaim as inject_user_message: a surface left occupying the
     # composer would swallow the C-u and the typed command.
-    _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+    surface = _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+    if surface is not None:
+        # Unlike inject_user_message there is no readiness gate below to
+        # catch this: nothing would draft, so the blind submit Enter would
+        # answer whatever holds the pane (a dialog's highlighted option)
+        # while this call reported success.
+        raise ClaudeTerminalDialog(
+            f"Claude Code's input box is occupied by {surface}, so the command was "
+            "not sent. Open the terminal, dismiss it, then retry."
+        )
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings."
@@ -5534,7 +5549,7 @@ def acknowledge_auto_mode_billing_notice(
 
 def _restore_occupied_input(
     socket_path: str, tmux_target: str, *, bridge_dir: Path | None = None
-) -> None:
+) -> str | None:
     """
     Dismiss a terminal-opened surface occupying Claude's input box.
 
@@ -5558,21 +5573,26 @@ def _restore_occupied_input(
     never blind, because on the bare composer Escape interrupts an
     in-flight turn. A screen with no input box counts only when it
     advertises Escape as its dismissal; before Claude Code draws its input
-    box the pane holds launcher output, which is left to the readiness
-    gate. An empty (torn) capture means "unknown" and gets no
-    Escape, and a surface seen in a single frame is re-confirmed a poll
-    later before an Escape is spent on it, so a repaint artifact cannot
-    draw one. A swallowed Escape is re-sent while the surface remains,
-    spaced by :data:`_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S`.
-    Best-effort: a surface that outlives
-    :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` is left on screen and the
-    caller's readiness gate or delivery verification fails loud, exactly
-    as it did before this restore existed.
+    box the pane holds launcher output, which is handed back to the caller
+    untouched: :func:`inject_user_message` waits on its readiness gate
+    (:func:`_wait_for_claude_prompt_ready`), :func:`inject_slash_command`
+    fails loud rather than type into it. An empty (torn) capture means
+    "unknown" and gets no Escape, and a surface seen in a single frame is
+    re-confirmed a poll later before an Escape is spent on it — or before
+    it is given up as unclearable — so a repaint artifact cannot draw one.
+    A swallowed Escape is re-sent while the surface remains, spaced by
+    :data:`_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S`. Best-effort: a
+    surface that outlives :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` is
+    left on screen and returned, so the caller's readiness gate or
+    delivery verification fails loud, exactly as it did before this
+    restore existed.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
-    :returns: None.
+    :returns: ``None`` once the input box is free (or the capture is torn);
+        otherwise the :func:`_occupying_surface` description of what is
+        still on screen, for the caller to refuse to type into.
     """
     deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
     last_escape: float | None = None
@@ -5588,12 +5608,10 @@ def _restore_occupied_input(
             )
         if auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
-            return
+            return None
         surface = _occupying_surface(pane)
         if surface is None:
-            return
-        if surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane):
-            return
+            return None
         now = time.monotonic()
         if now >= deadline:
             _logger.warning(
@@ -5601,13 +5619,19 @@ def _restore_occupied_input(
                 surface,
                 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S,
             )
-            return
+            return surface
         if not confirmed:
-            # One sighting is not enough to spend an Escape on: on a bare
-            # composer Escape interrupts the running turn, and a single frame
-            # can misreport during a repaint. A real surface is still there a
-            # poll later; a repaint artifact is not.
+            # One sighting is not enough to spend an Escape on — or to give a
+            # surface up as unclearable: on a bare composer Escape interrupts
+            # the running turn, and a single frame can misreport during a
+            # repaint. A real surface is still there a poll later; a repaint
+            # artifact is not.
             confirmed = True
+        elif surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane):
+            # Nothing an Escape can clear: launcher output before the input
+            # box mounts, or a dialog that offers no dismissal. Hand it back
+            # rather than spend Escapes that reach the composer later.
+            return surface
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             _logger.info("claude-native: dismissing %s covering the input box", surface)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
