@@ -17,7 +17,7 @@ import { createRef, StrictMode, type ComponentRef, type ReactElement } from "rea
 import { MemoryRouter } from "react-router-dom";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { useChatStore, type ChatState } from "@/store/chatStore";
+import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -160,7 +160,7 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GoalApiModule>()),
   getGoal: vi.fn(),
 }));
-import type { ElicitationBlock } from "@/lib/blocks";
+import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking } from "./ChatPage";
@@ -1111,6 +1111,63 @@ describe("Composer slash-command submit routing", () => {
 
     expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
     // It's a slash_command event, NOT a plaintext message.
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("routes a skill whose name contains spaces, with and without args", () => {
+    // SKILL.md frontmatter names may carry spaces and parentheses; the
+    // catalog's full name must match, not just the first token.
+    const name = "Simplified Technical English (ASD-STE100)";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Rewrite per ASD-STE100." }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    // Menu completion leaves "/<name> " in the composer; Enter must submit it.
+    fireEvent.change(ta, { target: { value: `/${name} ` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(name, "");
+
+    fireEvent.change(ta, { target: { value: `/${name} rewrite this paragraph` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenLastCalledWith(name, "rewrite this paragraph");
+    expect(onSendSlashCommand).toHaveBeenCalledTimes(2);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("routes a known skill whose first word is not command-shaped", () => {
+    // The catalog match outranks the "/name" shape guard, so "Node.js" works.
+    const name = "Node.js Best Practices";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Idiomatic Node.js." }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: `/${name} for this module` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(name, "for this module");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("prefers a multi-word skill over a built-in matching only its first word", () => {
+    const name = "Help Desk";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Triage a support request." }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: `/${name} summarize` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(name, "summarize");
     expect(onSend).not.toHaveBeenCalled();
   });
 
@@ -2374,8 +2431,11 @@ describe("Composer shared visible controls", () => {
     expect(screen.queryByTestId("composer-settings")).toBeNull();
     expect(trailing.firstElementChild).toContainElement(harnessPicker);
     expect(actions.children).toHaveLength(3);
-    expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
-    expect(textarea().closest("form")).toHaveClass("pb-[max(20px,env(safe-area-inset-bottom))]");
+    expect(workspace).toHaveClass("mx-3", "h-7", "md:h-[37px]", "rounded-t-2xl");
+    expect(textarea().closest("form")).toHaveClass(
+      "px-6",
+      "pb-[max(20px,env(safe-area-inset-bottom))]",
+    );
     // A normal working directory has no empty worktree affordance.
     expect(within(workspace).queryByTestId("composer-git-branch")).toBeNull();
     expect(screen.getByTestId("composer-host-select")).toHaveClass("w-11", "md:h-7");
@@ -3294,6 +3354,29 @@ describe("Composer slash-command highlight overlay", () => {
     expect(screen.getByTestId("composer-highlight-overlay")).toHaveClass("text-ui");
   });
 
+  it("tints the full name of a skill with spaces, leaving args default", () => {
+    const name = "Simplified Technical English (ASD-STE100)";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Rewrite per ASD-STE100." }],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: `/${name} rewrite this` } });
+    expect(tintedText()).toBe(`/${name}`);
+    expect(overlayText()).toBe(`/${name} rewrite this`);
+  });
+
+  it("tints a known skill whose first word is not command-shaped", () => {
+    const name = "Node.js Best Practices";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Idiomatic Node.js." }],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: `/${name} here` } });
+    expect(tintedText()).toBe(`/${name}`);
+  });
+
   it("renders no overlay for plain prose", () => {
     render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: "just a normal message" } });
@@ -3523,6 +3606,8 @@ describe("Composer reply quotes", () => {
       skills: [],
       blocks: [],
       failedSendDraft: null,
+      restoredSendDraft: null,
+      pendingRetryStableId: null,
       queuedMessages: [],
     });
   });
@@ -3903,6 +3988,194 @@ describe("Composer reply quotes", () => {
     if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
   });
 
+  it("empties the composer when a restored failed send turns out delivered", () => {
+    const stableId = "c".repeat(32);
+    render(<Composer {...composerProps()} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "resend me",
+          files: [],
+          stableId,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("resend me");
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({ stableId, delivered: false });
+
+    // The send's committed item arrived (see retractDeliveredSendDraft):
+    // the message was delivered, so the untouched restore must go away.
+    act(() =>
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: "conv_test",
+          stableId,
+          text: "resend me",
+          files: [],
+          delivered: true,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(getSessionDraft("conv_test")).toBeUndefined();
+  });
+
+  it("retracts delivery that arrives while the failed draft restore is rendering", () => {
+    const stableId = "8".repeat(32);
+    render(<Composer {...composerProps()} />);
+    const unsubscribe = useChatStore.subscribe((state) => {
+      if (state.restoredSendDraft?.stableId !== stableId || state.restoredSendDraft.delivered)
+        return;
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: stableId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "resend me" }] },
+      });
+    });
+    try {
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: "resend me",
+            files: [],
+            stableId,
+          },
+        }),
+      );
+      expect(textarea()).toHaveValue("");
+      expect(useChatStore.getState().restoredSendDraft).toBeNull();
+      expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+      expect(getSessionDraft("conv_test")).toBeUndefined();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("keeps the user's edits when the delivered retraction lands", () => {
+    const stableId = "d".repeat(32);
+    render(<Composer {...composerProps()} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "resend me",
+          files: [],
+          stableId,
+        },
+      }),
+    );
+    fireEvent.change(textarea(), { target: { value: "resend me, but edited" } });
+
+    act(() =>
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: "conv_test",
+          stableId,
+          text: "resend me",
+          files: [],
+          delivered: true,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("resend me, but edited");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+  });
+
+  it("drops a failed-send draft whose message already committed under its stable id", () => {
+    const stableId = "e".repeat(32);
+    render(<Composer {...composerProps()} />);
+    const committed: UserMessageBlock = {
+      type: "user_message",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: stableId },
+      content: [{ type: "input_text", text: "resend me" }],
+    };
+    // Delivery proof landed before the restore ran: only the acknowledgement
+    // was lost, so the stale draft must be dropped rather than restored.
+    act(() =>
+      useChatStore.setState({
+        blocks: [committed],
+        failedSendDraft: { conversationId: "conv_test", text: "resend me", files: [], stableId },
+      }),
+    );
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    expect(getSessionDraft("conv_test")).toBeUndefined();
+  });
+
+  it("restores a server-refused draft even though its persisted item is in the transcript", () => {
+    const stableId = "9".repeat(32);
+    render(<Composer {...composerProps()} />);
+    const persisted: UserMessageBlock = {
+      type: "user_message",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: stableId },
+      content: [{ type: "input_text", text: "resend me" }],
+    };
+    // The server persisted the message but refused to dispatch it, and a
+    // snapshot merge rendered the item before the user came back. That is not
+    // delivery: the text and its retry id must come back for a resend.
+    act(() =>
+      useChatStore.setState({
+        blocks: [persisted],
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "resend me",
+          files: [],
+          stableId,
+          serverRefused: true,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("resend me");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingRetryStableId).toBe(stableId);
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      stableId,
+      serverRefused: true,
+      delivered: false,
+    });
+  });
+
+  it("does not clear a new identical draft after submitting an edited restored send", async () => {
+    const stableId = "f".repeat(32);
+    // Submit through the store: the queued path is what a mid-turn Enter takes.
+    renderWithTooltips(
+      <Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />,
+    );
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text: "continue", files: [], stableId },
+      }),
+    );
+    expect(textarea()).toHaveValue("continue");
+
+    fireEvent.change(textarea(), { target: { value: "continue, but edited" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+
+    // A NEW draft that merely repeats the old text...
+    fireEvent.change(textarea(), { target: { value: "continue" } });
+    await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe("continue"));
+    // ...must survive the old send's delivery evidence arriving late.
+    act(() =>
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: stableId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "continue" }] },
+      }),
+    );
+    expect(textarea()).toHaveValue("continue");
+    expect(getSessionDraft("conv_test")?.text).toBe("continue");
+  });
+
   it.each([false, true])(
     "edits and persists queued messages with explicit metadata only: %s",
     (structured) => {
@@ -3994,6 +4267,8 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
       failedSendDraft: null,
       queuedMessages: [],
       sessionHarness: "codex-native",
+      sideChatToOpen: null,
+      sideChatDrafts: {},
     });
   });
 
@@ -4003,58 +4278,18 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
     vi.restoreAllMocks();
   });
 
-  it("adds the selection as a quote card and flags it a side chat", () => {
+  it("opens a pending side-chat tab quoting the selection, leaving the main composer empty", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     render(<Composer {...composerProps()} ref={ref} />);
 
     act(() => ref.current?.startSideChat("restore the row on failure"));
 
-    // Renders exactly like a reply quote (card + empty tail input), plus the
-    // side-chat hint so the user knows this will fork.
+    const { sideChatToOpen, sideChatDrafts } = useChatStore.getState();
+    expect(sideChatToOpen?.parentId).toBe("conv_test");
+    expect(sideChatToOpen?.childId).toMatch(/^pending:/);
+    expect(sideChatDrafts[sideChatToOpen!.childId]).toBe("restore the row on failure");
     expect(textarea()).toHaveValue("");
-    expect(
-      screen.getByTestId("composer-reply-quote").querySelector("blockquote"),
-    ).toHaveTextContent("restore the row on failure");
-    expect(screen.getByTestId("composer-side-chat-hint")).toBeInTheDocument();
-  });
-
-  it("sends as a /side command carrying the quoted selection and the question", () => {
-    const props = composerProps();
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    render(<Composer {...props} ref={ref} />);
-
-    act(() => ref.current?.startSideChat("restore the row on failure"));
-    fireEvent.change(textarea(), { target: { value: "why is this safe?" } });
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-
-    // Prefixed with /side so the existing pipeline forks it; no reply-draft
-    // snapshot (a side chat keeps no main-chat bubble).
-    expect(props.onSend).toHaveBeenCalledWith(
-      "/side > restore the row on failure\n\nwhy is this safe?",
-      undefined,
-    );
-    expect(textarea()).toHaveValue("");
-  });
-
-  it("falls back to a normal reply when the session has no side-chat harness", () => {
-    // Side chat is generic now (every harness supports it), so the only
-    // no-side-chat case is a session with no bound harness — then a quoted
-    // "Ask in side chat" degrades to an ordinary reply.
-    useChatStore.setState({ sessionHarness: "" });
-    const props = composerProps();
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    render(<Composer {...props} ref={ref} />);
-
-    act(() => ref.current?.startSideChat("some selection"));
-    fireEvent.change(textarea(), { target: { value: "a question" } });
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-
-    // No /side prefix, no fork; sends as an ordinary quoted reply with its snapshot.
-    expect(props.onSend).toHaveBeenCalledWith("> some selection\n\na question", undefined, {
-      version: 1,
-      quotes: [{ before: "", text: "some selection" }],
-      text: "a question",
-    });
+    expect(screen.queryByTestId("composer-reply-quote")).not.toBeInTheDocument();
   });
 
   it.each([
@@ -4066,8 +4301,7 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     render(<Composer {...composerProps(overrides)} ref={ref} />);
     act(() => ref.current?.startSideChat("selected text"));
-    expect(textarea()).toHaveValue("");
-    expect(screen.queryByTestId("composer-reply-quote")).not.toBeInTheDocument();
+    expect(useChatStore.getState().sideChatToOpen).toBeNull();
   });
 });
 
@@ -5435,7 +5669,7 @@ describe("Composer config gear", () => {
     expect(calls).toEqual(["model", "effort"]);
   });
 
-  it("shows a titled actionable tooltip when a session config update fails", async () => {
+  it("leaves no lingering error indicator when a session config update fails", async () => {
     const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
     const options = [
       { id: "opus", model: "opus", displayName: "Opus" },
@@ -5454,12 +5688,14 @@ describe("Composer config gear", () => {
 
     await openSessionModels();
     fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
-    const error = await screen.findByTestId("composer-config-error");
-    fireEvent.focus(error);
-    const tooltip = await screen.findByTestId("composer-config-error-tooltip");
-    expect(tooltip).toHaveTextContent("Couldn’t update configuration");
-    expect(tooltip).toHaveTextContent("Host stopped responding");
-    expect(tooltip).toHaveTextContent("Try again");
+    await waitFor(() =>
+      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
+    );
+    expect(screen.queryByTestId("composer-config-error")).not.toBeInTheDocument();
+    expect(screen.queryByText("Host stopped responding")).not.toBeInTheDocument();
   });
 
   it("recomputes the Codex effort ladder after a confirmed model change and drops an unsupported level", async () => {

@@ -809,6 +809,20 @@ export interface ConversationState {
     files: File[];
     stableId?: string;
     replyDraft?: StoredReplyDraft;
+    /**
+     * The send is known refused (an error answer to the POST, a snapshot
+     * rejection naming its item, or an unanswered untouched retry of such a
+     * send): its persisted item cannot prove delivery; only a live
+     * `session_input_consumed` can. `false` for a plain transport failure.
+     */
+    serverRefused?: boolean;
+    /**
+     * The POST got no answer and the follow-up verdict fetch failed too, so
+     * the item in the transcript may predate the runner's verdict. The composer
+     * restores the text regardless; the next live acknowledgement or snapshot
+     * settles it (see `committedItemProvesDelivery`).
+     */
+    unsettled?: boolean;
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -816,6 +830,22 @@ export interface ConversationState {
    * duplicate dispatch on retry.
    */
   pendingRetryStableId: string | null;
+  /**
+   * A failed-send draft the composer has restored, kept until the send's fate
+   * is known: a committed item under its `stable_id` proves the POST reached
+   * the server, `delivered` flips true, and the composer drops the restored
+   * text (see ChatPage's retraction effect). User edits win over the retraction.
+   */
+  restoredSendDraft: {
+    conversationId: string;
+    stableId: string;
+    text: string;
+    files: File[];
+    replyDraft?: StoredReplyDraft;
+    /** Carried over from `failedSendDraft.serverRefused`; see there. */
+    serverRefused?: boolean;
+    delivered: boolean;
+  } | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -987,6 +1017,16 @@ export interface ConversationState {
  * screen, what its composer is holding). They stay on the root store when
  * per-conversation state moves out.
  */
+/** One side chat's unsent composer contents. */
+export interface SideChatComposerDraft {
+  text: string;
+  files: File[];
+}
+
+/** The empty composer, shared so an absent entry keeps a stable identity (a
+ *  fresh object per render would re-render every subscriber). */
+export const EMPTY_SIDE_CHAT_COMPOSER: SideChatComposerDraft = { text: "", files: [] };
+
 export interface AppChatState {
   /** The conversation currently on screen. `null` on `/`. */
   conversationId: string | null;
@@ -1021,9 +1061,16 @@ export interface AppChatState {
    * chat (its own managed fork) so the typed question isn't lost — the side
    * chat's composer seeds from and consumes it on mount rather than firing a
    * turn at a runner that is still launching. App-global (the side chat lives in
-   * the main chat's rail, not its own entry).
+   * the main chat's rail, not its own entry). Keyed by a `pending:` tab id, it is
+   * instead the "Ask in side chat" selection that tab's composer quotes.
    */
   sideChatDrafts: Record<string, string>;
+  /**
+   * Unsent composer state per side-chat child id, retained across the pane's
+   * unmounts (rail tab switch, breakpoint cross, drawer teardown). In-memory
+   * only: `File` values aren't serializable.
+   */
+  sideChatComposers: Record<string, SideChatComposerDraft>;
   /**
    * Messages submitted while the agent is busy, held client-side (not yet
    * POSTed) and shown in the composer's queue strip. The head is flushed
@@ -1070,6 +1117,13 @@ export interface ChatActions {
   openSideChatWithDraft: (childSessionId: string, draft: string, parentId: string) => void;
   /** Clear a side chat's seeded composer draft (called after it's consumed). */
   clearSideChatDraft: (childSessionId: string) => void;
+  /** Update one side chat's unsent composer state (text + attachments). */
+  updateSideChatComposer: (
+    childSessionId: string,
+    mutate: (current: SideChatComposerDraft) => SideChatComposerDraft,
+  ) => void;
+  /** Drop a side chat's unsent composer state (sent, or the tab was closed). */
+  clearSideChatComposer: (childSessionId: string) => void;
   /**
    * Queue a message client-side instead of POSTing it now, for a send made
    * while the agent is busy. The head is flushed automatically (FIFO, one per
@@ -1422,6 +1476,14 @@ interface SendChain {
   tail: Promise<void>;
 }
 const sendChains = new Map<string | symbol, SendChain>();
+
+/**
+ * Sends whose POST has not settled, by stable id, flagged `true` once a live
+ * `session_input_consumed` named the id. Read by `send()`'s failure path: that
+ * acknowledgement proves THIS attempt was taken even when the POST's answer is
+ * lost and an earlier refused attempt's item already sits in the transcript.
+ */
+const inFlightSends = new Map<string, boolean>();
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -1815,6 +1877,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
   pendingRetryStableId: null,
+  restoredSendDraft: null,
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
@@ -1822,6 +1885,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   awaitingSideChatFor: null,
   sideChatToOpen: null,
   sideChatDrafts: {},
+  sideChatComposers: {},
   subAgentName: null,
   contextWindow: null,
   tokensUsed: null,
@@ -1846,6 +1910,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const queueId = `q_${queueSeq}`;
     const stableId = randomUUID().replace(/-/g, "");
     setActive((s) => ({
+      // Queueing consumes the composer like a send does: a restored failed
+      // send is no longer what the composer holds, and the queued message
+      // carries its own id, so neither the tracker nor the retry id may
+      // outlive this submission.
+      pendingRetryStableId: null,
+      restoredSendDraft: null,
       queuedMessages: [
         ...s.queuedMessages,
         {
@@ -2128,6 +2198,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       sideChatDrafts: draft ? { ...s.sideChatDrafts, [childSessionId]: draft } : s.sideChatDrafts,
     }));
   },
+  updateSideChatComposer: (childSessionId, mutate) => {
+    useChatStore.setState((s) => ({
+      sideChatComposers: {
+        ...s.sideChatComposers,
+        [childSessionId]: mutate(s.sideChatComposers[childSessionId] ?? EMPTY_SIDE_CHAT_COMPOSER),
+      },
+    }));
+  },
+  clearSideChatComposer: (childSessionId) => {
+    useChatStore.setState((s) => {
+      if (!(childSessionId in s.sideChatComposers)) return {};
+      return {
+        sideChatComposers: Object.fromEntries(
+          Object.entries(s.sideChatComposers).filter(([key]) => key !== childSessionId),
+        ),
+      };
+    });
+  },
   clearSideChatDraft: (childSessionId) => {
     useChatStore.setState((s) => {
       if (!(childSessionId in s.sideChatDrafts)) return {};
@@ -2148,12 +2236,32 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // screen. `pinnedSetter` routes every write for this send there.
     const pinnedId = opts?.pinnedConversationId ?? null;
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
-    const retryId =
-      pinnedId === null
-        ? get().pendingRetryStableId
-        : (setterForState(pinnedId)?.pendingRetryStableId ?? null);
-    if (retryId !== null) pinnedSetter({ pendingRetryStableId: null });
-    const stableId = opts?.stableId ?? retryId ?? randomUUID().replace(/-/g, "");
+    const pinnedState = pinnedId === null ? get() : setterForState(pinnedId);
+    const retryId = pinnedState?.pendingRetryStableId ?? null;
+    const restoredDraft = pinnedState?.restoredSendDraft ?? null;
+    // Submitting consumes what the composer held, a restored failed send
+    // included: drop its tracker too, or delivery evidence for that send could
+    // later retract a NEW draft that merely repeats the same text.
+    if (retryId !== null || restoredDraft !== null) {
+      pinnedSetter({ pendingRetryStableId: null, restoredSendDraft: null });
+    }
+    // A restored failed send keeps its stable id only when resent untouched:
+    // the server persists a web send under that id and dedupes a repeat, so an
+    // edited body under the old id would run without ever being persisted.
+    const reusableRetryId =
+      retryId !== null &&
+      restoredSendDraftUnchanged(restoredDraft, retryId, text, files, opts?.replyDraft)
+        ? retryId
+        : null;
+    // An untouched retry of a send the server refused goes out under the id of
+    // an item the transcript already holds, so that item cannot prove THIS
+    // attempt was delivered: the refusal stands until a live acknowledgement.
+    const retriesRefusedSend =
+      reusableRetryId !== null &&
+      restoredDraft !== null &&
+      restoredDraft.stableId === reusableRetryId &&
+      restoredDraft.serverRefused === true;
+    const stableId = opts?.stableId ?? reusableRetryId ?? randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
     // into the running task's inbox. Keep `activeResponse` untouched in
@@ -2289,6 +2397,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return state?.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft);
     };
 
+    inFlightSends.set(stableId, false);
     try {
       await waitForPrior();
       if (initialDraft && !initialSendPending()) return;
@@ -2425,8 +2534,38 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // (`failedSendDraft` is conversation-scoped); the composer reads whichever
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
+      // A coded error confirms refusal; a transport failure leaves delivery
+      // unknown unless this retries a previously refused send.
+      const answeredWithRefusal = err instanceof ApiError && err.code !== null;
+      let serverRefused = answeredWithRefusal || retriesRefusedSend;
+      const draftState =
+        draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
+      // A live `session_input_consumed` for this very attempt proves the runner
+      // took it, whatever became of the POST's answer.
+      let deliveredDespiteFailure = inFlightSends.get(stableId) === true;
+      let unsettled = false;
+      if (
+        !deliveredDespiteFailure &&
+        !serverRefused &&
+        draftSessionId !== null &&
+        hasCommittedItem(draftState.blocks, stableId)
+      ) {
+        // Only a snapshot can have put the item in the transcript, and it may
+        // predate the runner's verdict (the server persists before it forwards).
+        // The server records a rejection before answering the POST, so a fresh
+        // snapshot settles it; if that fetch fails too, the draft comes back
+        // unsettled and the next live acknowledgement or snapshot decides.
+        const verdict = await sendVerdictFromServer(draftSessionId, stableId);
+        // The acknowledgement may have landed while that fetch was out; it
+        // outranks whatever the fetch said or failed to say.
+        if (inFlightSends.get(stableId) === true) deliveredDespiteFailure = true;
+        else if (verdict === "refused") serverRefused = true;
+        else if (verdict === "delivered") deliveredDespiteFailure = true;
+        else unsettled = true;
+      }
       if (
         !callerHandlesError &&
+        !deliveredDespiteFailure &&
         draftSessionId !== null &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {
@@ -2436,6 +2575,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             text,
             files: files ?? [],
             stableId,
+            serverRefused,
+            ...(unsettled ? { unsettled: true } : {}),
             ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
           },
         });
@@ -2487,6 +2628,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }
       }
     } finally {
+      inFlightSends.delete(stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
       releaseSend();
@@ -2922,31 +3064,44 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   setEffort: async (effort) => {
+    const { conversationId, sessionReasoningEffort: previous } = get();
     setActive({ sessionReasoningEffort: effort });
-    const { conversationId } = get();
     if (conversationId) {
       if (queryClient === null) {
         throw new Error("chatStore.setEffort: queryClient not initialized");
       }
-      const session = await queryClient.fetchQuery({
-        queryKey: ["session", conversationId],
-        queryFn: () => getSessionSlim(conversationId),
-        staleTime: Infinity,
-        retry: false,
-      });
-      // Harness has no effort control: undo the optimistic session-scoped write
-      // so this conversation doesn't claim an effort the server will never hold.
-      if (!supportsEffortControl(session)) {
-        setterFor(conversationId)({ sessionReasoningEffort: null });
-        return;
+      const pick = trackLiveSettingPick(conversationId, "reasoningEffort", previous);
+      try {
+        const session = await queryClient.fetchQuery({
+          queryKey: ["session", conversationId],
+          queryFn: () => getSessionSlim(conversationId),
+          staleTime: Infinity,
+          retry: false,
+        });
+        // Harness has no effort control: undo the optimistic session-scoped write
+        // so this conversation doesn't claim an effort the server will never hold.
+        if (!supportsEffortControl(session)) {
+          setterFor(conversationId)({ sessionReasoningEffort: null });
+          return;
+        }
+        await updateSession(conversationId, { reasoningEffort: effort });
+        pick.confirm(effort);
+      } catch (err) {
+        // Adopt the server's settled effort, not an earlier unconfirmed pick; keep a newer pick.
+        const settled = await settledSessionSetting(conversationId, "reasoningEffort", pick);
+        setterFor(conversationId)((s) =>
+          s.sessionReasoningEffort === effort ? { sessionReasoningEffort: settled } : {},
+        );
+        throw err;
+      } finally {
+        pick.done();
       }
-      await updateSession(conversationId, { reasoningEffort: effort });
     }
   },
 
   setModel: async (model, opts) => {
+    const { conversationId, sessionModelOverride: previous } = get();
     setActive({ sessionModelOverride: model });
-    const { conversationId } = get();
     if (conversationId) {
       const expectConfirmation = opts?.expectConfirmation === true && model !== null;
       if (expectConfirmation) {
@@ -2967,17 +3122,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           );
         }, 30_000);
       }
+      const pick = trackLiveSettingPick(conversationId, "modelOverride", previous);
       let session;
       try {
         session = await updateSession(conversationId, { modelOverride: model });
+        pick.confirm(session.modelOverride ?? null);
       } catch (err) {
-        // The ask never reached the server — nothing will confirm it.
-        if (expectConfirmation) {
-          setterFor(conversationId)((s) =>
-            s.pendingModelChange === model ? { pendingModelChange: null } : {},
-          );
-        }
+        // Nothing will confirm a refused ask; adopt the server's settled model unless
+        // a newer pick replaced it.
+        const settled = await settledSessionSetting(conversationId, "modelOverride", pick);
+        setterFor(conversationId)((s) => ({
+          ...(expectConfirmation && s.pendingModelChange === model
+            ? { pendingModelChange: null }
+            : {}),
+          ...(s.sessionModelOverride === model ? { sessionModelOverride: settled } : {}),
+        }));
         throw err;
+      } finally {
+        pick.done();
       }
       // Server-canonical may differ from the optimistic write (e.g.
       // when a clear alias was sent) — refresh local state to match.
@@ -3408,6 +3570,69 @@ function abortConversationStream(entry: ConversationEntry): void {
 function setterForState(conversationId: string): ChatState | null {
   const entry = conversationRegistry.peek(conversationId);
   return entry === undefined ? null : entryGetter(entry)();
+}
+
+type LiveSettingField = "reasoningEffort" | "modelOverride";
+
+/** One live pick of a session setting, sharing the confirmed value with overlapping picks. */
+interface LiveSettingPick {
+  confirm: (value: string | null) => void;
+  confirmed: () => string | null;
+  done: () => void;
+}
+
+/** Last server-confirmed value of each session setting that has picks in flight. */
+const confirmedLiveSettings = new Map<string, { value: string | null; picks: number }>();
+
+/**
+ * Track a live pick of *field*, starting from *current* when no other pick is in flight.
+ *
+ * An overlapping pick's optimistic value may never apply, so it is not a fallback.
+ */
+function trackLiveSettingPick(
+  conversationId: string,
+  field: LiveSettingField,
+  current: string | null,
+): LiveSettingPick {
+  const key = `${conversationId}:${field}`;
+  let entry = confirmedLiveSettings.get(key);
+  if (entry === undefined) {
+    entry = { value: current, picks: 0 };
+    confirmedLiveSettings.set(key, entry);
+  }
+  entry.picks += 1;
+  const tracked = entry;
+  return {
+    confirm: (value) => {
+      tracked.value = value;
+    },
+    confirmed: () => tracked.value,
+    done: () => {
+      tracked.picks -= 1;
+      if (tracked.picks === 0) confirmedLiveSettings.delete(key);
+    },
+  };
+}
+
+/**
+ * Read a session setting after a refused change.
+ *
+ * The server orders and rolls back live settings changes, so its value is the
+ * settled one; an earlier optimistic pick may never have applied. If the lookup
+ * fails, fall back to the last value the server confirmed.
+ */
+async function settledSessionSetting(
+  conversationId: string,
+  field: LiveSettingField,
+  pick: LiveSettingPick,
+): Promise<string | null> {
+  try {
+    const value = (await getSessionSlim(conversationId))[field] ?? null;
+    pick.confirm(value);
+    return value;
+  } catch {
+    return pick.confirmed();
+  }
 }
 
 /**
@@ -3937,11 +4162,9 @@ function sessionBindingPatch(
  * Re-derive the agent-binding-dependent store state from a fresh session
  * snapshot, after a `session.agent_changed` SSE event.
  *
- * The switch-agent route mutates the session in place (new agent clone,
- * recomputed harness presentation labels) without a navigation, so the
- * URL-driven `switchTo`/`bindStream` path never re-runs — this is the
- * only thing that updates the store's binding state for an in-place
- * switch. Fetches through the shared `["session", id]` query key with
+ * The change happens without a navigation, so the URL-driven
+ * `switchTo`/`bindStream` path never re-runs; this is the only thing
+ * that updates the store's binding state. Fetches through the shared `["session", id]` query key with
  * `staleTime: 0` so the React-query consumers (header, pickers) get the
  * fresh snapshot too. No-op when the session changed mid-fetch or the
  * fetch fails (transient — any later rebind re-derives from scratch).
@@ -4834,6 +5057,7 @@ async function rehydrateWindowOnReconnect(
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
+  const freshItemIds = new Set(fresh.items.map((it) => it.id));
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
@@ -4853,6 +5077,9 @@ async function rehydrateWindowOnReconnect(
     );
     return {
       ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      // Same persisted-item evidence as the reconnect path: a rehydrated item
+      // can be a send whose POST died in the gap.
+      ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
       blocks:
         reconcileElicitationBlocks(
           merged,
@@ -4985,6 +5212,7 @@ async function reconcileOnReconnect(
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
+  const snapshotItemIds = new Set(items.map((it) => it.id));
   set((s) => {
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
@@ -4995,7 +5223,13 @@ async function reconcileOnReconnect(
       s.isNativeTerminalSession && unseen.some((b) => b.type === "text_done" && b.ctx.itemId)
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
-    const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
+    const patch: Partial<ChatState> = {
+      ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      // A gap-committed item can be a send whose POST died in the gap: it
+      // retracts the draft, or marks it refused when the snapshot says the
+      // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
+      ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session),
+    };
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
     const recoveredUserInputs = unseen.filter(
@@ -6222,8 +6456,204 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   return content;
 }
 
-function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
+export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
   return itemId !== "" && blocks.some((block) => block.ctx.itemId === itemId);
+}
+
+/**
+ * Whether a committed item proves a failed send was delivered.
+ *
+ * The item under the send's stable id must be in `blocks`, and the server must
+ * not have refused the send: a refused message is persisted too, so its
+ * presence in the transcript says nothing about the runner having taken it
+ * (see `retractDeliveredSendDraft`). Nor is an unsettled draft proven: the item
+ * it sees may predate the verdict (see `failedSendDraft.unsettled`).
+ *
+ * @param blocks - The conversation's rendered blocks.
+ * @param draft - The failed send's stable id and what is known of its fate.
+ * @returns `true` when restoring the draft would prime a duplicate send.
+ */
+export function committedItemProvesDelivery(
+  blocks: AnyBlock[],
+  draft: { stableId?: string; serverRefused?: boolean; unsettled?: boolean },
+): boolean {
+  return (
+    draft.stableId !== undefined &&
+    draft.serverRefused !== true &&
+    draft.unsettled !== true &&
+    hasCommittedItem(blocks, draft.stableId)
+  );
+}
+
+/**
+ * Whether a resend matches the restored failed-send draft exactly.
+ *
+ * Only then may it reuse the draft's stable id: the server dedupes a repeated
+ * id to the item already persisted, so changed text, reply metadata or
+ * attachments must go out under a fresh id.
+ *
+ * @param restored - The restored draft being tracked, if any.
+ * @param stableId - The retry id about to be reused.
+ * @param text - Outgoing text.
+ * @param files - Outgoing attachments.
+ * @param replyDraft - Outgoing reply metadata.
+ * @returns `true` when nothing differs, or when no draft is tracked for the id.
+ */
+function restoredSendDraftUnchanged(
+  restored: ConversationState["restoredSendDraft"],
+  stableId: string,
+  text: string,
+  files: File[] | undefined,
+  replyDraft: StoredReplyDraft | undefined,
+): boolean {
+  if (restored === null || restored.stableId !== stableId) return true;
+  const outgoing = files ?? [];
+  return (
+    restored.text === text &&
+    outgoing.length === restored.files.length &&
+    outgoing.every((file) => restored.files.includes(file)) &&
+    JSON.stringify(restored.replyDraft ?? null) === JSON.stringify(replyDraft ?? null)
+  );
+}
+
+/**
+ * Retract a failed-send draft once its message is proven delivered.
+ *
+ * A committed item under the send's `stable_id` means the POST reached the
+ * server. Clears an un-restored draft, flips a restored one to `delivered` so
+ * the composer drops its text, and stops the next send from reusing the id
+ * (the store would dedupe it away).
+ *
+ * The server persists before it forwards, so a persisted item alone does not
+ * prove the runner took the message. `"persisted"` proof (a reconnect
+ * snapshot or window rehydrate) therefore retracts only a draft whose send
+ * got no server answer: the acknowledgement was lost and the item is its
+ * durable trace. A draft the server refused (`serverRefused`) keeps its text
+ * and retry id until a live `"consumed"` acknowledgement, which the server
+ * publishes only after a successful forward.
+ *
+ * @param s - The conversation's state.
+ * @param committedItemIds - Item ids just committed (live event or snapshot).
+ * @param proof - `"consumed"` for a `session_input_consumed` event,
+ *   `"persisted"` for items read back from a snapshot.
+ * @returns The state patch, empty when nothing matches.
+ */
+function retractDeliveredSendDraft(
+  s: ChatState,
+  committedItemIds: ReadonlySet<string>,
+  proof: "consumed" | "persisted",
+): Partial<ChatState> {
+  const patch: Partial<ChatState> = {};
+  type Tracked = { stableId?: string; serverRefused?: boolean } | null;
+  const delivered = (draft: Tracked): boolean => {
+    const stableId = draft?.stableId;
+    if (stableId === undefined || !committedItemIds.has(stableId)) return false;
+    return proof === "consumed" || draft?.serverRefused !== true;
+  };
+  if (delivered(s.failedSendDraft)) {
+    patch.failedSendDraft = null;
+  }
+  if (
+    s.restoredSendDraft !== null &&
+    !s.restoredSendDraft.delivered &&
+    delivered(s.restoredSendDraft)
+  ) {
+    patch.restoredSendDraft = { ...s.restoredSendDraft, delivered: true };
+  }
+  // The retry id belongs to the restored draft it came from, so a refused
+  // send keeps it: an untouched resend must still dedupe against the item.
+  const retryId = s.pendingRetryStableId;
+  if (retryId !== null) {
+    const owner =
+      s.restoredSendDraft?.stableId === retryId ? s.restoredSendDraft : { stableId: retryId };
+    if (delivered(owner)) patch.pendingRetryStableId = null;
+  }
+  return patch;
+}
+
+/**
+ * Whether a session snapshot records the runner refusing the send `stableId`.
+ *
+ * An attributed rejection names its item and holds whatever the session is
+ * doing now; the unattributed record of a server predating the item id stands
+ * for any send, but only while the session is still `failed` by it.
+ *
+ * @param session - A session snapshot.
+ * @param stableId - The send's stable id (its persisted item id).
+ * @returns `true` when the snapshot's `runner_rejected_event` applies to it.
+ */
+function snapshotRefusesSend(session: Session, stableId: string): boolean {
+  const rejection = session.lastTaskError;
+  if (rejection?.code !== "runner_rejected_event") return false;
+  if (rejection.item_id !== undefined) return rejection.item_id === stableId;
+  return session.status === "failed";
+}
+
+/**
+ * Ask the server what became of a send whose POST got no answer.
+ *
+ * The server records a runner rejection before it answers the POST, so a
+ * snapshot fetched after the failure is conclusive where one merged during the
+ * send may not be.
+ *
+ * @param sessionId - The session the send was posted to.
+ * @param stableId - The send's stable id.
+ * @returns `"refused"` or `"delivered"`, or `null` when the fetch itself fails.
+ */
+async function sendVerdictFromServer(
+  sessionId: string,
+  stableId: string,
+): Promise<"refused" | "delivered" | null> {
+  try {
+    const session = await getSessionSlim(sessionId);
+    return snapshotRefusesSend(session, stableId) ? "refused" : "delivered";
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reconcile a failed-send draft against a reconnect snapshot.
+ *
+ * A snapshot item under the draft's stable id proves delivery (see
+ * `retractDeliveredSendDraft`) unless the snapshot also records the runner
+ * refusing that send (see `snapshotRefusesSend`): the server persists the
+ * rejection before answering the POST, so a refusal whose answer was lost still
+ * surfaces here. Such a draft is flagged `serverRefused` and kept, text and
+ * retry id included.
+ *
+ * @param s - The conversation's state.
+ * @param itemIds - Item ids the snapshot holds.
+ * @param session - The reconnect snapshot.
+ * @returns The state patch, empty when nothing matches.
+ */
+function reconcileSendDraftWithSnapshot(
+  s: ChatState,
+  itemIds: ReadonlySet<string>,
+  session: Session,
+): Partial<ChatState> {
+  if (session.lastTaskError?.code !== "runner_rejected_event") {
+    return retractDeliveredSendDraft(s, itemIds, "persisted");
+  }
+  const refused = (stableId: string | undefined): boolean =>
+    stableId !== undefined && itemIds.has(stableId) && snapshotRefusesSend(session, stableId);
+  const patch: Partial<ChatState> = {};
+  const failed = s.failedSendDraft;
+  if (failed !== null && failed.serverRefused !== true && refused(failed.stableId)) {
+    patch.failedSendDraft = { ...failed, serverRefused: true };
+  }
+  const restored = s.restoredSendDraft;
+  if (
+    restored !== null &&
+    !restored.delivered &&
+    restored.serverRefused !== true &&
+    refused(restored.stableId)
+  ) {
+    patch.restoredSendDraft = { ...restored, serverRefused: true };
+  }
+  // Every other draft the snapshot holds an item for was delivered: the
+  // rejection names a different message.
+  return { ...patch, ...retractDeliveredSendDraft({ ...s, ...patch }, itemIds, "persisted") };
 }
 
 /**
@@ -6687,8 +7117,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToNamedConversation(event.conversationId, { viewers: event.viewers });
       return;
     case "session_agent_changed":
-      // The session's bound agent was switched in place (switch-agent
-      // route). Apply the binding the event itself carries immediately,
+      // The session's bound agent changed. Apply the binding the event itself carries immediately,
       // then re-derive the label-dependent state (most importantly
       // isNativeTerminalSession, which gates the optimistic-bubble
       // lifecycle) from a fresh snapshot — the event is the only signal
@@ -7017,6 +7446,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     }
     case "session_input_consumed":
+      // This committed item may be a send whose POST failed client-side —
+      // its arrival proves that send was delivered, so retract the draft
+      // before it (re)populates the composer with an already-sent prompt.
+      if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
+      applyToConversation((s) => retractDeliveredSendDraft(s, new Set([event.itemId]), "consumed"));
       // Hidden meta inputs stay hidden — except a background-task wake,
       // which `userContentFromEvent` re-labels as a system marker.
       if (event.isMeta === true && userContentFromEvent(event) === null) return;
