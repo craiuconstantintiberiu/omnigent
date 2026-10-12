@@ -316,6 +316,7 @@ describe("useWorkspaceChangedFiles gating", () => {
       defaultOptions: { queries: { retry: false, staleTime: 0 } },
     });
     let priorSignal: AbortSignal | undefined;
+    let nextSignal: AbortSignal | undefined;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/resources/environments/default")) {
@@ -324,6 +325,9 @@ describe("useWorkspaceChangedFiles gating", () => {
       if (url.includes("/conv_prior/") && url.endsWith("/changes")) {
         priorSignal = init?.signal ?? undefined;
         return new Promise<Response>(() => {});
+      }
+      if (url.includes("/conv_next/") && url.endsWith("/changes")) {
+        nextSignal = init?.signal ?? undefined;
       }
       return Promise.resolve(changedFilesResponse());
     });
@@ -334,6 +338,7 @@ describe("useWorkspaceChangedFiles gating", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(priorSignal).toBeDefined());
+    expect(priorSignal?.aborted).toBe(false);
 
     rerender(
       <QueryClientProvider client={queryClient}>
@@ -342,6 +347,8 @@ describe("useWorkspaceChangedFiles gating", () => {
     );
 
     await waitFor(() => expect(priorSignal?.aborted).toBe(true));
+    await waitFor(() => expect(nextSignal).toBeDefined());
+    expect(nextSignal?.aborted).toBe(false);
   });
 
   it("fetches when status is unknown (undefined)", async () => {

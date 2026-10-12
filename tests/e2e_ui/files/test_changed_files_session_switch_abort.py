@@ -7,9 +7,10 @@ Query (``useWorkspaceChangedFiles``). TanStack hands the query function an
 is exactly what happens when the user switches to another session while the
 request is still in flight. The hook must forward that signal to
 ``authenticatedFetch`` so the obsolete request is actually cancelled at the
-network layer; when it is dropped, the stale request keeps consuming network
-and runner/server work after the switch, and rapid switching stacks several
-such requests.
+network layer; when it is dropped, the stale request keeps holding a browser
+connection after the switch, and rapid switching stacks several such
+requests. The server and runner still finish their side of a cancelled
+request.
 
 There is no on-screen error to assert on — the user-visible journey is just
 "open a session, switch to another one" and the leak is only observable at
@@ -125,6 +126,16 @@ def test_session_switch_cancels_pending_changed_files_request(
         page.wait_for_timeout(200)
     assert held, "session A's changed-files request never fired"
 
+    def _session_a_outcomes() -> list[str]:
+        entries = page.evaluate("window.__changesFetches")
+        return [e["outcome"] for e in entries if session_a in e["url"]]
+
+    # Nothing may be cancelled yet, so the abort below is tied to the switch.
+    assert not cancelled, f"session A's request failed before the switch: {cancelled}"
+    assert "AbortError" not in _session_a_outcomes(), (
+        "session A's request was aborted before the switch"
+    )
+
     # Switch to session B in place: session A's query loses its observers
     # while its request is still in flight.
     page.locator(f'a[href="/c/{session_b}"]').click()
@@ -132,10 +143,6 @@ def test_session_switch_cancels_pending_changed_files_request(
     assert page.evaluate("window.__documentLoadMarker") == load_marker, (
         "session switch reloaded the document; the reproduction needs an in-place SPA navigation"
     )
-
-    def _session_a_outcomes() -> list[str]:
-        entries = page.evaluate("window.__changesFetches")
-        return [e["outcome"] for e in entries if session_a in e["url"]]
 
     deadline = time.monotonic() + _CANCEL_WAIT_S
     while time.monotonic() < deadline:
