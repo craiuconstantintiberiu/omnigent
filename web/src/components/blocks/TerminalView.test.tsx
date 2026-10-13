@@ -10,7 +10,7 @@ import type * as TerminalSessionModule from "./TerminalSession";
 import type * as TerminalsModule from "@/lib/terminals";
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { StrictMode, act, useMemo } from "react";
+import { StrictMode, act, useMemo, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
@@ -130,6 +130,8 @@ beforeEach(() => {
   render(<Toaster visibleToasts={100} />);
   terminalSessionMock.instances = [];
   clipboardMock.copyText.mockReset().mockResolvedValue(undefined);
+  vi.mocked(resolveInitialAttachUrl).mockReset();
+  vi.mocked(watchDirectUpgrade).mockReset();
 });
 
 afterEach(() => {
@@ -1203,6 +1205,30 @@ describe("unmount", () => {
 
     expect(terminalSessionMock.instances[0].dispose).toHaveBeenCalledTimes(1);
     expect(onStateChange).toHaveBeenLastCalledWith(null);
+  });
+
+  it.each([
+    ["plain", (el: ReactElement) => el],
+    ["StrictMode", (el: ReactElement) => <StrictMode>{el}</StrictMode>],
+  ])("lets a same-id successor's state win over the outgoing null (%s)", async (_name, wrap) => {
+    const onStateChange = vi.fn();
+    const view = (conv: string) =>
+      wrap(
+        <div key={`${conv}:terminal_claude_main`}>
+          <TerminalView
+            sessionId={conv}
+            terminalId="terminal_claude_main"
+            onStateChange={onStateChange}
+          />
+        </div>,
+      );
+    const { rerender } = render(view("conv_a"));
+    await act(async () => {});
+    expect(onStateChange).toHaveBeenLastCalledWith({ kind: "connecting" });
+    rerender(view("conv_b"));
+    await act(async () => {});
+
+    expect(onStateChange).toHaveBeenLastCalledWith({ kind: "connecting" });
   });
 
   it("does not dial when it unmounts while the initial URL is resolving", async () => {

@@ -497,14 +497,16 @@ export function TerminalView({
 
   useLayoutEffect(() => {
     mountedRef.current = true;
+    onStateChangeRef.current?.(stateRef.current);
     return () => {
       mountedRef.current = false;
+      // Synchronous so a same-id successor's first report lands after it.
+      onStateChangeRef.current?.(null);
       // Deferred so StrictMode's dev-only remount keeps the live attach.
       queueMicrotask(() => {
         if (mountedRef.current) return;
         upgradeCtlRef.current?.abort();
         disposeActiveSession();
-        onStateChangeRef.current?.(null);
       });
     };
   }, [disposeActiveSession]);
