@@ -17,7 +17,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10445,9 +10445,10 @@ class _EditableComposer:
         """
         :param draft: Text the person left in the box.
         :param cursor: Cursor offset into *draft*.
-        :param visible_rows: When set, the pane is a sliver with room for the
-            box's opening rule and this many rows only, so the closing rule
-            never comes on screen (the ``_SLIVER_MULTILINE_DRAFT_PANE``
+        :param visible_rows: When set, the pane is a sliver with room for this
+            many lines under the box's opening rule. A draft that fits with
+            the closing rule shows framed; a taller one is cut off at the
+            bottom of the pane without it (the ``_SLIVER_MULTILINE_DRAFT_PANE``
             geometry). ``None`` shows the whole box.
         """
         self.text = draft
@@ -10490,7 +10491,8 @@ class _EditableComposer:
         del socket_path, tmux_target
         first, *rest = self.text.split("\n")
         rows = [f"❯ {first}", *(f"  {row}" for row in rest)]
-        if self._visible_rows is not None:
+        if self._visible_rows is not None and len(rows) >= self._visible_rows:
+            # The rows take every line the pane has: no closing rule.
             clipped = "\n".join(rows[: self._visible_rows])
             return f"⏺ done\n{self._RULE}\n{clipped}\n"
         return f"{self._RULE}\n" + "\n".join(rows) + f"\n{self._RULE}\n  ? for shortcuts\n"
@@ -10528,11 +10530,12 @@ _STALE_DRAFT_CURSORS = pytest.mark.parametrize(
     [0, len("STALE ONE\nSTA"), len(_STALE_MULTILINE_DRAFT)],
     ids=["cursor-at-start", "cursor-mid-draft", "cursor-at-end"],
 )
-# ``None`` shows the whole box. ``1`` is a sliver pane with room for the
-# opening rule and one row only, so a capture cannot tell a one-line draft
-# from the first line of a longer one.
+# ``None`` shows the whole box. ``2`` is a sliver pane with room for two
+# lines under the opening rule: a one-row draft shows framed, while the
+# three-line draft is cut off without its closing rule, so a capture cannot
+# tell how much of it lies below the pane.
 _BOX_GEOMETRIES = pytest.mark.parametrize(
-    "visible_rows", [None, 1], ids=["whole-box-on-screen", "sliver-pane"]
+    "visible_rows", [None, 2], ids=["whole-box-on-screen", "sliver-pane"]
 )
 
 
@@ -10585,6 +10588,40 @@ def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     assert composer.submitted == ["/effort high"]
+
+
+@pytest.mark.parametrize(
+    "inject",
+    [
+        lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+        lambda bridge_dir: claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/effort high"
+        ),
+    ],
+    ids=["web-message", "slash-command"],
+)
+def test_a_draft_the_clearing_budget_cannot_empty_is_refused_not_submitted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject: Callable[[Path], None],
+) -> None:
+    """
+    Running out of clearing rounds refuses the injection instead of pasting.
+
+    A pane with room for one row of the box shows one line of a four-line
+    draft per round and never its closing rule, so after the budget a line
+    is still in the box and no capture can prove otherwise. Pasting anyway
+    would submit that leftover line with the message or command.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer("ONE\nTWO\nTHREE\nFOUR", cursor=0, visible_rows=1)
+    composer.install(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"):
+        inject(bridge_dir)
+
+    assert composer.submitted == []
+    assert "FOUR" in composer.text, "The leftover line should still be the person's to deal with."
 
 
 @pytest.mark.parametrize(

@@ -308,9 +308,7 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # rather than as text when they arrive in one burst.
 _COMPOSER_KILL_TO_LINE_END = "\x1b[107;5u"
 _COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
-# Rounds of clearing for a draft the pane cannot show whole: a draft taller
-# than the pane shows only some of its rows at a time, and a sliver-height
-# pane never has room for the box's closing rule at all.
+# Re-clear rounds when the capture cannot show the whole box.
 _COMPOSER_CLEAR_MAX_ROUNDS = 3
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
@@ -626,6 +624,10 @@ class ClaudeUserPromptPending(RuntimeError):
 
 class ClaudeMessageNotAccepted(RuntimeError):
     """The submitted draft remained in Claude's input box until the deadline."""
+
+
+class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
+    """A draft left in Claude's input box could not be cleared, so nothing was sent."""
 
 
 @contextlib.contextmanager
@@ -4296,6 +4298,8 @@ def _paste_and_submit(
     :returns: None.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending before the submit Enter; the message was not sent.
+    :raises ClaudeComposerNotCleared: If a draft left in the input box could
+        not be cleared first; the message was not sent.
     :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
         never leaves the input box after repeated submit Enters, or if a
         prompt appears after the submit Enter.
@@ -5903,8 +5907,8 @@ class _ComposerBox(NamedTuple):
     #: The box's rows, e.g. ``["❯ fix the bug", "  in foo.py"]``. Blank rows
     #: are kept, since a draft's empty lines are lines too.
     rows: list[str]
-    #: Whether the closing rule was on screen. Only then is ``rows`` the whole
-    #: draft; otherwise the pane ran out of room and the draft may go on below.
+    #: Whether the closing rule was on screen, so ``rows`` is the whole box
+    #: rather than the part of it above the bottom of the pane.
     framed: bool
 
 
@@ -5914,10 +5918,8 @@ def _composer_box(pane: str) -> _ComposerBox | None:
 
     The box is located as in :func:`_composer_row`: its first row sits
     directly under the opening rule, led by a composer glyph. The rows run to
-    the closing rule, or to the bottom of the pane when a draft taller than
-    the pane, or a sliver-height pane, pushes the closing rule off screen;
-    the result says which, since a cut-off box may hold rows the capture
-    did not show.
+    the closing rule, or to the bottom of the pane when there is none on
+    screen.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The box's visible rows and whether its closing rule was on
@@ -5951,26 +5953,33 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     One burst is known to have emptied the box only when the capture showed
     the box whole (closing rule on screen) with a single row. A box with
     more rows, or one cut off by the bottom of the pane (a draft taller than
-    the pane, or a sliver-height pane that never has room for the closing
-    rule), may still hold lines the capture did not show, so it is cleared
-    again, up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds in all.
+    the pane, or a sliver-height pane with no room for the closing rule),
+    may still hold lines the capture did not show, so it is cleared again,
+    up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds. A box still in that
+    state afterwards is refused rather than pasted into: an exhausted budget
+    is no evidence the box is empty, and a paste beside leftover text would
+    submit the person's draft along with the injected input.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :raises ClaudeComposerNotCleared: If the rounds ran out before a capture
+        showed the box whole and down to one row; nothing was pasted.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
-    for _ in range(_COMPOSER_CLEAR_MAX_ROUNDS):
+    for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
         box = _composer_box(_capture_pane(socket_path, tmux_target))
+        settled = box is None or (box.framed and len(box.rows) <= 1)
+        if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+            raise ClaudeComposerNotCleared(
+                "A draft left in Claude Code's input box could not be cleared, so nothing "
+                "was sent. Open the terminal, clear the input box, then retry."
+            )
         presses = 2 * len(box.rows) if box is not None else 2
         keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
         _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
-        if box is None or (box.framed and len(box.rows) <= 1):
+        if settled:
             return
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    _logger.debug(
-        "Composer clear spent its %d rounds without a capture showing the box whole and empty",
-        _COMPOSER_CLEAR_MAX_ROUNDS,
-    )
 
 
 def _claude_prompt_rendered(pane: str) -> bool:
