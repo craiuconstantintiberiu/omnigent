@@ -3599,12 +3599,23 @@ def _build_host_daemon_env(
     )
 
     if not server_url:
+        from omnigent.telemetry.environment import CI_ENV_VARS
+
+        # The local server detects CI and usage opt-outs in its own environment.
+        local_server_env_vars = (
+            _LOCAL_DAEMON_ENV_ALLOWLIST
+            | CI_ENV_VARS
+            | {
+                "DISABLE_TELEMETRY",
+                "DO_NOT_TRACK",
+            }
+        )
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, *_LOCAL_DAEMON_ENV_PREFIXES)
         env = {
             key: value
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST
-            or key in _LOCAL_DAEMON_ENV_ALLOWLIST
+            or key in local_server_env_vars
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
             or key.startswith(daemon_env_prefixes)
@@ -4592,6 +4603,20 @@ def server(
 
             databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
 
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig
+
+    mcp_registry = None
+    registry_config = McpRegistryConfig.from_env()
+    if registry_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+        from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+
+        registry_cipher = build_secret_cipher()
+        mcp_registry = McpRegistry(
+            registry_config,
+            CredentialStore(db_uri, registry_cipher) if registry_cipher else None,
+        )
+
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit
     # OMNIGENT_AUTH_PROVIDER=accounts), supply sensible defaults
@@ -4661,6 +4686,7 @@ def server(
         sandbox_config=sandbox_config,
         github_config=github_config,
         github_store=github_store,
+        mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
         server_config=title_server_config,

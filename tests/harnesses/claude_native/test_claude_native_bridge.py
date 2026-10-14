@@ -4052,6 +4052,11 @@ def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
     assert before <= payload["updated_at"] <= after
 
 
+# Each send-keys first leaves copy mode in the same tmux call; without it,
+# a pane the reader scrolled back hands the keys to tmux instead of Claude.
+_LEAVE_COPY_MODE = ["copy-mode", "-q", "-t", "claude:0.0", ";"]
+
+
 @pytest.mark.parametrize(
     "content,expected_payload",
     [
@@ -4148,6 +4153,7 @@ def test_inject_user_message_pastes_content_then_submits(
         f"got {len(captured)}."
     )
     clear, load, paste, submit = captured
+    assert clear[3:8] == _LEAVE_COPY_MODE
     assert clear[-4:] == ["-l", "-t", "claude:0.0", _CLEAR_ONE_ROW_COMPOSER]
     # The buffer file carried the normalized content + trailing CR. A
     # missing trailing CR is the trailing-CR regression; a newline that stayed
@@ -4179,6 +4185,7 @@ def test_inject_user_message_pastes_content_then_submits(
         "tmux",
         "-S",
         "/tmp/example/tmux.sock",
+        *_LEAVE_COPY_MODE,
         "send-keys",
         "-t",
         "claude:0.0",
@@ -4871,8 +4878,9 @@ def test_inject_user_message_raises_when_draft_never_submits(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered"):
+    with pytest.raises(RuntimeError, match="message was not delivered") as caught:
         inject_user_message(bridge_dir, content="fix the flaky test")
+    assert isinstance(caught.value, claude_native_bridge.ClaudeMessageNotAccepted)
 
 
 def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(
@@ -5115,6 +5123,7 @@ def test_inject_interrupt_sends_escape_keystroke(
         "tmux",
         "-S",
         "/tmp/example/tmux.sock",
+        *_LEAVE_COPY_MODE,
         "send-keys",
         "-t",
         "claude:0.0",
@@ -5361,6 +5370,7 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         "tmux",
         "-S",
         "/tmp/example/tmux.sock",
+        *_LEAVE_COPY_MODE,
         "send-keys",
         "-l",
         "-t",
@@ -5371,6 +5381,7 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         "tmux",
         "-S",
         "/tmp/example/tmux.sock",
+        *_LEAVE_COPY_MODE,
         "send-keys",
         "-l",
         "-t",
@@ -5381,6 +5392,7 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         "tmux",
         "-S",
         "/tmp/example/tmux.sock",
+        *_LEAVE_COPY_MODE,
         "send-keys",
         "-t",
         "claude:0.0",
@@ -9154,6 +9166,7 @@ def _assistant_entry(
     output_tokens: int,
     is_sidechain: bool = False,
     request_id: str | None = None,
+    message_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Build one assistant transcript record with a usage block.
@@ -9164,8 +9177,9 @@ def _assistant_entry(
     :param is_sidechain: When ``True`` mark the record ``isSidechain``
         (how a sub-agent message is inlined into a parent transcript).
     :param request_id: Top-level ``requestId`` to stamp, e.g.
-        ``"req_A"``. ``None`` omits it (records without a ``requestId``
-        are each billed once, never collapsed together).
+        ``"req_A"``. ``None`` omits it.
+    :param message_id: ``message.id`` to stamp, e.g. ``"msg_A"``.
+        ``None`` omits it.
     :returns: A decoded transcript record dict.
     """
     entry: dict[str, Any] = {
@@ -9179,45 +9193,87 @@ def _assistant_entry(
         entry["isSidechain"] = True
     if request_id is not None:
         entry["requestId"] = request_id
+    if message_id is not None:
+        entry["message"]["id"] = message_id
     return entry
 
 
-def test_compute_transcript_cumulative_cost_dedupes_by_request_id(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    "identities",
+    [
+        pytest.param([("msg_A", None), ("msg_A", None)], id="message"),
+        pytest.param([(None, "req_A"), (None, "req_A")], id="request"),
+        pytest.param([("msg_A", "req_A"), ("msg_A", "req_A")], id="both"),
+        pytest.param([("msg_A", None), ("msg_A", "req_A")], id="request-late"),
+        pytest.param([("msg_A", "req_A"), ("msg_A", None)], id="request-missing"),
+        pytest.param([(None, "req_A"), ("msg_A", "req_A")], id="message-late"),
+        pytest.param([("msg_A", "req_A"), (None, "req_A")], id="message-missing"),
+    ],
+)
+def test_compute_transcript_cumulative_cost_dedupes_inference_records(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identities: list[tuple[str | None, str | None]],
 ) -> None:
-    """
-    Records sharing a ``requestId`` are billed once, not once per record.
-
-    Claude writes the same API response as multiple transcript records (a
-    streamed partial plus the final record), each carrying that response's
-    full ``usage`` under one ``requestId``. Summing every record
-    double-bills (observed ~2x inflation, which leaked into the parent
-    badge and the cost-budget gate). The cost must dedupe by ``requestId``.
-    """
+    """Repeated inference records retain the last priceable usage, including legacy IDs."""
     from omnigent.llms.context_window import ModelPricing
 
     pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
-    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: pricing if model == "m" else None,
+    )
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
     claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
     path = tmp_path / "transcript.jsonl"
+    (first_message_id, first_request_id), (last_message_id, last_request_id) = identities
     _write_transcript_jsonl(
         path,
         [
-            # Two records, SAME requestId = one billed response (2*10 + 3*20 = 80).
-            _assistant_entry(model="m", input_tokens=2, output_tokens=3, request_id="req_A"),
-            _assistant_entry(model="m", input_tokens=2, output_tokens=3, request_id="req_A"),
-            # Distinct requestId = a second billed response (1*10 + 1*20 = 30).
-            _assistant_entry(model="m", input_tokens=1, output_tokens=1, request_id="req_B"),
+            _assistant_entry(
+                model="m",
+                input_tokens=2,
+                output_tokens=1,
+                message_id=first_message_id,
+                request_id=first_request_id,
+            ),
+            _assistant_entry(
+                model="m", input_tokens=1, output_tokens=1, message_id="msg_B", request_id="req_B"
+            ),
+            _assistant_entry(
+                model="m",
+                input_tokens=2,
+                output_tokens=3,
+                message_id=last_message_id,
+                request_id=last_request_id,
+            ),
+            _assistant_entry(
+                model="unpriced",
+                input_tokens=99,
+                output_tokens=99,
+                message_id="msg_A",
+                request_id="req_A",
+            ),
         ],
     )
     cost = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
-    # 80 + 30 = 110. Without dedup the duplicate req_A record adds another
-    # 80 → 190, the ~2x over-report this dedup fixes.
     assert cost == pytest.approx(110.0)
 
 
+@pytest.mark.parametrize(
+    "identities",
+    [
+        pytest.param([(None, None), (None, None)], id="anonymous"),
+        pytest.param([("", ""), ("", "")], id="empty-ids"),
+        pytest.param([(None, "req_A"), (None, "req_B")], id="distinct-requests"),
+        pytest.param([("same", None), (None, "same")], id="separate-namespaces"),
+        pytest.param([(None, None), (None, "__no_request_id_0")], id="anonymous-label-collision"),
+    ],
+)
 def test_compute_transcript_cumulative_cost_sums_priced_messages(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identities: list[tuple[str | None, str | None]],
 ) -> None:
     """
     Cost is the sum over every priced assistant message in the transcript.
@@ -9230,14 +9286,28 @@ def test_compute_transcript_cumulative_cost_sums_priced_messages(
 
     pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
     monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
     claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
     path = tmp_path / "transcript.jsonl"
+    (first_message_id, first_request_id), (last_message_id, last_request_id) = identities
     _write_transcript_jsonl(
         path,
         [
-            _assistant_entry(model="m", input_tokens=2, output_tokens=3),  # 2*10 + 3*20 = 80
+            _assistant_entry(
+                model="m",
+                input_tokens=2,
+                output_tokens=3,
+                message_id=first_message_id,
+                request_id=first_request_id,
+            ),
             {"message": {"role": "user", "content": "hi"}},  # no usage → skipped
-            _assistant_entry(model="m", input_tokens=1, output_tokens=1),  # 1*10 + 1*20 = 30
+            _assistant_entry(
+                model="m",
+                input_tokens=1,
+                output_tokens=1,
+                message_id=last_message_id,
+                request_id=last_request_id,
+            ),
         ],
     )
     cost = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
@@ -11117,6 +11187,40 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     assert tails[-1] == "Enter"
 
 
+def test_inject_user_message_refuses_a_shell_mode_draft_escape_cannot_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A shell-mode draft that outlives the reclaim is refused, not waited out.
+
+    Escape does not take a typed shell command out of the box, so the
+    readiness gate would poll its whole slow-boot budget for a ``❯`` that
+    cannot appear, and the delivery timeout then kills the healthy pane.
+    Only the dismissal Escapes may reach the pane.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    shell_draft_pane = (
+        "──────────────────────────────\n"
+        "! git status --short\n"
+        "──────────────────────────────\n"
+        "  ! for shell mode\n"
+    )
+    sends = _fake_tmux(monkeypatch, [shell_draft_pane])
+    # The pane is alive, so without the refusal the readiness gate keeps waiting.
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_args: claude_native_bridge._ClaudePaneState(alive=True),
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by shell mode"):
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    tails = [args[-1] for args in sends]
+    assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
+
+
 _MCP_APPROVAL_DIALOG_PANE = """\
 ────────────────────────────────────────────────────────────────────────────────
   New MCP server found in this project: e2e-noop
@@ -11968,6 +12072,52 @@ def _relay_request_raw(bridge_dir: Path, path: str, payload: dict[str, object]) 
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
         return resp.read().decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_relay_tool_update_preserves_cached_policy_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cached native credentials keep enforcing policy as tools and callbacks change."""
+    verdict = {"result": "POLICY_ACTION_DENY", "reason": "blocked by test"}
+    policy_client = _ScriptedPolicyClient(verdict)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, policy_client)
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+    initial = json.loads(relay_file.read_text())
+    calls: list[str] = []
+
+    async def first_executor(name: str, arguments: dict[str, object]) -> str:
+        calls.append("first")
+        return "first result"
+
+    async def second_executor(name: str, arguments: dict[str, object]) -> str:
+        calls.append("second")
+        return "second result"
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=initial["url"],
+            headers={"Authorization": f"Bearer {initial['token']}"},
+            trust_env=False,
+        ) as client:
+            for name, executor in (("first", first_executor), ("second", second_executor)):
+                relay.update_tools([{"name": name, "parameters": {"type": "object"}}], executor)
+                updated = json.loads(relay_file.read_text())
+                assert updated["url"] == initial["url"]
+                assert updated["token"] == initial["token"]
+                assert [tool["name"] for tool in updated["tools"]] == [name]
+                response = await client.post("/tool", json={"name": name, "arguments": {}})
+                assert response.status_code == 200
+                assert json.loads(response.json()["content"][0]["text"]) == {
+                    "result": f"{name} result"
+                }
+                response = await client.post("/policies/evaluate", json=_PRE_TOOL_USE_PAYLOAD)
+                assert response.status_code == 200
+                assert response.json() == verdict
+            assert calls == ["first", "second"]
+            assert policy_client.bodies == [_PRE_TOOL_USE_PAYLOAD, _PRE_TOOL_USE_PAYLOAD]
+    finally:
+        relay.close()
 
 
 @pytest.mark.asyncio

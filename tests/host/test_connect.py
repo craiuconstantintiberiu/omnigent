@@ -21,6 +21,7 @@ import click
 import pytest
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
+from websockets.frames import Close
 from websockets.http11 import Response
 
 from omnigent import debug_logging
@@ -999,12 +1000,25 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
 
 
 @pytest.mark.parametrize("binding_token", ["token_abc", "", "   "])
-@pytest.mark.parametrize("harness", ["codex", "pi-native"])
+@pytest.mark.parametrize(
+    ("harness", "selected_pi_version", "harness_ready", "inference_bound"),
+    [
+        ("codex", None, False, False),
+        ("pi-native", None, False, False),
+        ("pi-native", (0, 84, 1), False, False),
+        ("pi-native", (0, 84, 1), True, False),
+        ("pi-native", (0, 84, 1), True, True),
+        ("pi-native", (0, 85, 1), False, False),
+    ],
+)
 async def test_handle_launch_refuses_unconfigured_harness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     binding_token: str,
     harness: str,
+    selected_pi_version: tuple[int, int, int] | None,
+    harness_ready: bool,
+    inference_bound: bool,
 ) -> None:
     """
     Verify _handle_launch refuses to spawn when the frame's harness is
@@ -1023,21 +1037,42 @@ async def test_handle_launch_refuses_unconfigured_harness(
     # signature; the workspace exists so ONLY the harness check can fail.
     monkeypatch.setattr(
         "omnigent.host.connect.harness_is_configured",
-        lambda harness: False,
+        lambda harness: harness_ready,
     )
 
-    if harness == "pi-native":
+    if selected_pi_version is not None:
+        monkeypatch.setattr(
+            host, "_spawn_runner_proc", Mock(side_effect=AssertionError("Pi must not spawn"))
+        )
+        monkeypatch.setattr(
+            "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/selected/pi"
+        )
+        monkeypatch.setattr(
+            "omnigent.harnesses.pi_native.main.pi_version",
+            lambda _executable: selected_pi_version,
+        )
+    elif harness == "pi-native":
 
         def missing_pi() -> str:
             raise click.ClickException("Pi is not installed")
 
         monkeypatch.setattr("omnigent.harnesses.pi_native.main.resolve_pi_executable", missing_pi)
 
+    inference_config = None
+    if inference_bound:
+        monkeypatch.setattr(
+            "omnigent.onboarding.harness_install.missing_harness_cli", lambda _harness: None
+        )
+        inference_config = {
+            "providers": {"test": {}},
+            "inference": {"harnesses": {harness: {"provider": "test"}}},
+        }
     frame = HostLaunchRunnerFrame(
         request_id="req_unconfigured",
         binding_token=binding_token,
         workspace=str(workspace),
         harness=harness,
+        inference_config=inference_config,
     )
     result = await host._handle_launch(frame)
 
@@ -1047,9 +1082,13 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
     # The message is shown verbatim to the user — it must name the
     # harness, the host, and the remediation command.
-    assert repr(harness) in (result.error or "")
-    assert "test-laptop" in (result.error or "")
-    assert "omni setup" in (result.error or "")
+    if selected_pi_version == (0, 84, 1):
+        assert "installed Pi CLI (0.84.1)" in (result.error or "")
+        assert "Upgrade with:" in (result.error or "")
+    else:
+        assert repr(harness) in (result.error or "")
+        assert "test-laptop" in (result.error or "")
+        assert "omni setup" in (result.error or "")
     assert result.runner_id is None
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}
@@ -1095,10 +1134,21 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
 
 
 @pytest.mark.parametrize("discovery_pending", [False, True])
+@pytest.mark.parametrize(
+    ("harness", "pi_version"),
+    [
+        ("claude-sdk", None),
+        ("pi", (0, 84, 2)),
+        ("pi-native", (0, 85, 1)),
+        ("pi-native", None),
+    ],
+)
 async def test_handle_launch_configured_harness_proceeds_to_spawn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     discovery_pending: bool,
+    harness: str,
+    pi_version: tuple[int, int, int] | None,
 ) -> None:
     """
     Verify a configured harness passes the check and the launch
@@ -1115,6 +1165,13 @@ async def test_handle_launch_configured_harness_proceeds_to_spawn(
         "omnigent.host.connect.harness_is_configured",
         lambda harness: True,
     )
+    if harness in {"pi", "pi-native"}:
+        monkeypatch.setattr(
+            "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/selected/pi"
+        )
+        monkeypatch.setattr(
+            "omnigent.harnesses.pi_native.main.pi_version", lambda _executable: pi_version
+        )
     if discovery_pending:
 
         async def _blocked_discovery() -> None:
@@ -1142,7 +1199,7 @@ async def test_handle_launch_configured_harness_proceeds_to_spawn(
         request_id="req_configured",
         binding_token="token_def",
         workspace=str(workspace),
-        harness="claude-sdk",
+        harness=harness,
     )
     try:
         with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
@@ -5982,8 +6039,11 @@ async def test_reconnect_uses_shorter_handshake_timeout(
     assert [call["open_timeout"] for call in spy.calls] == [10.0, 3.0]
 
 
+@pytest.mark.parametrize("sent_close", [None, Close(1011, "keepalive ping timeout")])
 async def test_host_records_accepted_connection_and_disconnect(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    sent_close: Close | None,
 ) -> None:
     """The host reports lifecycle metrics only after an accepted upgrade."""
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
@@ -5991,6 +6051,12 @@ async def test_host_records_accepted_connection_and_disconnect(
     monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
     spy = _ConnectSpy([None, asyncio.CancelledError()])
     _patch_connect(monkeypatch, spy)
+    caplog.set_level(logging.INFO, logger="omnigent.host.connect")
+
+    async def close_tunnel(_ws: _DroppedTunnel) -> str:
+        raise ConnectionClosedError(None, sent_close)
+
+    monkeypatch.setattr(_DroppedTunnel, "recv", close_tunnel)
     connected: list[tuple[str, bool]] = []
     disconnected: list[tuple[str, BaseException | None]] = []
     monkeypatch.setattr(
@@ -6008,6 +6074,85 @@ async def test_host_records_accepted_connection_and_disconnect(
     assert len(disconnected) == 1
     assert disconnected[0][0] == "host"
     assert isinstance(disconnected[0][1], ConnectionClosedError)
+    (end,) = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "host_tunnel"
+        and r.attributes.get("phase") == "disconnected"
+    ]
+    assert end["close_rcvd_code"] is None
+    assert end["close_sent_code"] == (1011 if sent_close else None)
+    assert end["close_sent_reason"] == ("keepalive ping timeout" if sent_close else None)
+    assert end["disconnect_reason"] == ("ping_timeout" if sent_close else "transport_error")
+
+
+@pytest.mark.parametrize("abrupt", [False, True])
+async def test_host_diagnostics_correlate_real_socket_closes_and_reset_on_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    abrupt: bool,
+) -> None:
+    """Wire heartbeats and actual close frames reach the connection's snapshot."""
+    from websockets.asyncio.server import serve
+    from websockets.exceptions import ConnectionClosed
+
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        PingFrame,
+        PongFrame,
+        decode_frame,
+        encode_frame,
+    )
+    from tests.budgets import budget
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    caplog.set_level(logging.INFO, logger="omnigent.host.connect")
+    hellos: list[HostHelloFrame] = []
+
+    async def peer(ws):
+        hello = decode_host_frame(await ws.recv())
+        assert isinstance(hello, HostHelloFrame)
+        hellos.append(hello)
+        await ws.send(encode_frame(PingFrame(ts=123)))
+        assert decode_frame(await ws.recv()) == PongFrame(ts=123)
+        if abrupt:
+            ws.transport.abort()
+        else:
+            await ws.close(code=1000, reason="finished")
+
+    async with serve(peer, "127.0.0.1", 0) as server:
+        host = _host(f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+        host._owner_user_id = "test-owner"
+        monkeypatch.setattr(host, "_build_connect_headers", dict)
+        try:
+            for _ in range(2):
+                with pytest.raises(ConnectionClosed):
+                    await asyncio.wait_for(host._connect_and_serve(), timeout=budget(5.0))
+        finally:
+            await host._quiesce_frame_tasks()
+
+    rows = [
+        r.attributes for r in caplog.records if getattr(r, "event_name", None) == "host_tunnel"
+    ]
+    assert [r["phase"] for r in rows] == ["connected", "disconnected"] * 2
+    assert len(hellos) == 2
+    assert hellos[0].connection_id != hellos[1].connection_id
+    for hello, (start, end) in zip(hellos, (rows[:2], rows[2:]), strict=True):
+        assert hello.connection_id
+        assert start["connection_id"] == end["connection_id"] == hello.connection_id
+        assert start["last_app_ping_received_age_s"] is None
+        assert start["last_app_pong_sent_age_s"] is None
+        assert end["tunnel_side"] == "host"
+        assert end["last_app_ping_received_age_s"] is not None
+        assert end["last_app_pong_sent_age_s"] is not None
+        assert end["protocol_ping_interval_s"] == 30.0
+        assert end["protocol_ping_timeout_s"] == 90.0
+        assert end["transport_close_code"] == (1006 if abrupt else 1000)
+        assert end["close_rcvd_code"] == (None if abrupt else 1000)
+        assert end["close_rcvd_reason"] == (None if abrupt else "finished")
+        assert end["close_sent_code"] == (None if abrupt else 1000)
+        assert end["sends_in_flight"] == 0
+    assert not any(getattr(r, "event_name", None) == "host_tunnel_health" for r in caplog.records)
 
 
 def _refused_exc() -> ConnectionRefusedError:

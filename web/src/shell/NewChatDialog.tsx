@@ -1,6 +1,8 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useComposerContext } from "@/hooks/useComposerContext";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
+import { useMcpRegistrySelection } from "@/hooks/useMcpRegistry";
+import { McpRegistryLaunchPicker } from "./McpRegistryLaunchPicker";
 import {
   HarnessPicker,
   HarnessPickerEntry,
@@ -2064,6 +2066,7 @@ export function AgentHarnessPicker({
 // when the user navigates into an existing session and back. Module-scoped,
 // not persisted to storage (a page refresh starts clean); cleared on create.
 interface LandingDraft {
+  mcpRegistryServices: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
   // A draft restored under a DIFFERENT project only brings back its text and
   // attachments — the agent/host/workspace slots are discarded so the new
@@ -2287,6 +2290,7 @@ export function NewChatLandingScreen() {
         };
 
   const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -2317,6 +2321,14 @@ export function NewChatLandingScreen() {
   // fails closed (option hidden) until the boot probe resolves.
   const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
+  const {
+    selected: mcpRegistryServices,
+    toggle: toggleMcpRegistryService,
+    catalog: mcpRegistryCatalog,
+    selectionError: mcpSelectionError,
+    servicesForLaunch: mcpServicesForLaunch,
+  } = useMcpRegistrySelection(restoredDraft?.mcpRegistryServices, mcpRegistryEnabled);
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Which router can answer a pick. The external AI-Gateway router only covers
   // a family the host runs through the gateway; the built-in judge covers any
@@ -2634,6 +2646,7 @@ export function NewChatLandingScreen() {
   const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
+    mcpRegistryServices,
     project: projectParam,
     message,
     files,
@@ -4965,6 +4978,8 @@ export function NewChatLandingScreen() {
 
   const canSubmit =
     (message.trim().length > 0 || files.length > 0) &&
+    !mcpAuthorizing &&
+    mcpSelectionError === null &&
     !pickerLoading &&
     !workspaceStartLoading &&
     !worktreeRequestPending &&
@@ -4981,27 +4996,29 @@ export function NewChatLandingScreen() {
   // actionable (submitting, or mid-create).
   const submitDisabledReason = canSubmit
     ? null
-    : pendingSkillCompletion
-      ? "Loading skills…"
-      : pickerLoading || workspaceStartLoading || worktreeRequestPending
-        ? "Loading session configuration…"
-        : pickerSelectionError || sandboxCatalogError
-          ? (pickerSelectionError ?? sandboxCatalogError)
-          : sandboxSelected && sandboxRepoOverCap
-            ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-                maxSandboxRepos === 1 ? "repository" : "repositories"
-              } — remove the extras`
-            : sandboxSelected && !sandboxRepoValid
-              ? "Please enter a valid repository URL"
-              : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-                ? "Selected host is unavailable. Reconnect it or choose another host."
-                : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                  ? "Please choose a host and working directory"
-                  : configuredAgentUnavailable && selectedAgent == null
-                    ? "This project's configured agent is unavailable — pick an agent to continue"
-                    : message.trim().length === 0 && files.length === 0
-                      ? "Enter a message to get started"
-                      : null;
+    : mcpAuthorizing || mcpSelectionError
+      ? (mcpSelectionError ?? "Finish signing in to the MCP service…")
+      : pendingSkillCompletion
+        ? "Loading skills…"
+        : pickerLoading || workspaceStartLoading || worktreeRequestPending
+          ? "Loading session configuration…"
+          : pickerSelectionError || sandboxCatalogError
+            ? (pickerSelectionError ?? sandboxCatalogError)
+            : sandboxSelected && sandboxRepoOverCap
+              ? `This sandbox provider clones at most ${maxSandboxRepos} ${
+                  maxSandboxRepos === 1 ? "repository" : "repositories"
+                } — remove the extras`
+              : sandboxSelected && !sandboxRepoValid
+                ? "Please enter a valid repository URL"
+                : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+                  ? "Selected host is unavailable. Reconnect it or choose another host."
+                  : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                    ? "Please choose a host and working directory"
+                    : configuredAgentUnavailable && selectedAgent == null
+                      ? "This project's configured agent is unavailable — pick an agent to continue"
+                      : message.trim().length === 0 && files.length === 0
+                        ? "Enter a message to get started"
+                        : null;
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
@@ -5526,6 +5543,9 @@ export function NewChatLandingScreen() {
         // same way the fork-resume path does.
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = { labels: createLabels };
+        if (mcpServicesForLaunch.length) {
+          metadata.mcp_registry_services = mcpServicesForLaunch;
+        }
         // A config-seeded workspace is omitted on a `project_id` create so the
         // server default-fills it (same field semantics as the JSON path).
         if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
@@ -5605,6 +5625,7 @@ export function NewChatLandingScreen() {
             // Config-seeded agent on a `project_id` create: omitted so the
             // server default-fills it from the project config.
             ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
+            ...(mcpServicesForLaunch.length ? { mcp_registry_services: mcpServicesForLaunch } : {}),
             ...(createProjectId !== null ? { project_id: createProjectId } : {}),
             ...(sandboxSelected
               ? {
@@ -5929,6 +5950,17 @@ export function NewChatLandingScreen() {
     );
   };
 
+  const mcpRegistryPicker = mcpRegistryEnabled ? (
+    <McpRegistryLaunchPicker
+      key="mcp-registry-picker"
+      selected={mcpRegistryServices}
+      catalog={mcpRegistryCatalog}
+      disabled={creating}
+      onAuthorizingChange={setMcpAuthorizing}
+      onToggle={toggleMcpRegistryService}
+    />
+  ) : null;
+
   // The two compact triggers preserve the existing directory and worktree
   // actions while exposing their distinct state truthfully.
   const workspaceChip = (
@@ -6017,10 +6049,13 @@ export function NewChatLandingScreen() {
           )}
           data-testid="new-chat-landing-composer-surface"
         >
+          {/* Keep the tray mounted while the execution target changes. */}
           {sandboxSelected && (
             <ComposerWorkspaceBar
+              key="workspace-controls"
               className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
               data-testid="new-chat-landing-workspace-controls"
+              trailingContent={mcpRegistryPicker}
             >
               {/* Sandbox repository chip — the sandbox counterpart of the
               working-directory chip. There is no filesystem to browse
@@ -6230,8 +6265,10 @@ export function NewChatLandingScreen() {
           )}
           {!sandboxSelected && (
             <ComposerWorkspaceBar
+              key="workspace-controls"
               className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
               data-testid="new-chat-landing-workspace-controls"
+              trailingContent={mcpRegistryPicker}
             >
               {workspaceLoading && cachedWorkspace === null && (
                 <NewChatPickerLoading

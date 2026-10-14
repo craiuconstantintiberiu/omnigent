@@ -470,16 +470,24 @@ class _FakeRunnerRouter:
 
 @pytest.fixture
 def runner_globals_reset() -> Iterator[None]:
+    from omnigent.server.routes._sessions.common import (
+        get_server_runner_router,
+        set_server_runner_router,
+    )
+
     prior_client = _globals._runner_client
     prior_router = _globals._runner_router
     prior_direct = _globals._runner_direct_attach_resolver
+    prior_server_router = get_server_runner_router()
     set_runner_client(None)
     set_runner_router(None)
     set_runner_direct_attach_resolver(None)
+    set_server_runner_router(None)
     yield
     set_runner_client(prior_client)
     set_runner_router(prior_router)
     set_runner_direct_attach_resolver(prior_direct)
+    set_server_runner_router(prior_server_router)
 
 
 @pytest.fixture
@@ -4792,8 +4800,10 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("agent_revision", [None, "bundle.zip:mcp:selection-v2"])
 async def test_kiro_native_dispatch_forwards_without_persisting(
     caplog: pytest.LogCaptureFixture,
+    agent_revision: str | None,
 ) -> None:
     """Kiro web-chat input is mirrored by Kiro's session forwarder."""
     from omnigent.runtime import pending_inputs
@@ -4822,6 +4832,7 @@ async def test_kiro_native_dispatch_forwards_without_persisting(
             store,  # type: ignore[arg-type]
             client,  # type: ignore[arg-type]
             agent_name="kiro-native-ui",
+            agent_revision=agent_revision,
             file_store=None,
             artifact_store=None,
             created_by="alice@example.com",
@@ -4840,6 +4851,10 @@ async def test_kiro_native_dispatch_forwards_without_persisting(
         assert store.appended_items == []
         forwarded = client.post_json_calls[1][1]
         assert forwarded["agent_id"] == "2c515637c67d0717ad0bebc2747b71bc"
+        if agent_revision is None:
+            assert "agent_revision" not in forwarded
+        else:
+            assert forwarded["agent_revision"] == agent_revision
         assert forwarded["model"] == "kiro-native-ui"
         assert forwarded["input_stable_id"] == "a" * 32
         assert forwarded["pending_id"] == result.pending_id
@@ -4852,6 +4867,7 @@ async def test_kiro_native_dispatch_forwards_without_persisting(
             store,
             client,  # type: ignore[arg-type]
             agent_name="kiro-native-ui",
+            agent_revision=agent_revision,
             file_store=None,
             artifact_store=None,
             created_by="alice@example.com",
@@ -6416,6 +6432,9 @@ class _ReconnectWaitRouter:
     def __init__(self, *, reconnects: bool) -> None:
         self._reconnects = reconnects
         self.waits: list[tuple[str, float]] = []
+
+    def require_mcp_registry_support(self, conversation: Conversation) -> None:
+        """These reconnect fixtures have no registry MCPs."""
 
     async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
         self.waits.append((runner_id, timeout_s))

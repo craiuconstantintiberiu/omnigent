@@ -58,6 +58,7 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+CAP_MCP_REGISTRY = "mcp_registry"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -66,6 +67,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
+    CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
 ]
@@ -206,6 +208,8 @@ class HostHelloFrame:
         (see ``HOST_CAPABILITIES`` / ``CAP_*``). Empty from an older host that
         predates a given capability, so the server treats absence as "not
         supported" without a version check.
+    :param connection_id: Host-minted identifier for this socket, shared with
+        server diagnostics. Absent from older hosts.
     """
 
     version: str
@@ -218,6 +222,7 @@ class HostHelloFrame:
     telemetry_opt_out: bool = False
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
+    connection_id: str | None = None
 
 
 @dataclass
@@ -1359,6 +1364,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
+                "connection_id": frame.connection_id,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -2244,6 +2250,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
+        connection_id=_optional_nullable_str(msg, "connection_id"),
     )
 
 

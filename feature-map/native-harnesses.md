@@ -57,6 +57,10 @@ view appear in the session.
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
 
+**Approval inbox:** open Inbox in the sidebar to answer a pending permission
+without opening its session. Antigravity's Chat and Inbox cards both offer
+the advertised session and saved-rule choices.
+
 **Skill contents:** Settings → Harnesses → configured harness card (or gear),
 then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
 list or plugin.
@@ -130,6 +134,14 @@ the extra fields. Resolver and raw-tunnel checks:
 
 Cross-harness journeys:
 
+- **Antigravity permission choices (Chat and Inbox):**
+  `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
+  uses a recorded permission prompt and the real server to check both choices
+  on both surfaces. Chat records the choice as requested, since Antigravity
+  does not confirm rule persistence. This does not run a live Antigravity
+  terminal or prove that a rule is saved. Saved rules belong to the current
+  Omnigent session; new sessions have separate settings.
+
 - **`launch-cli` and `launch-web`, Pi CLI compatibility (own environment):**
   `tests/e2e/test_pi_native_cli_version_floor_e2e.py::test_real_pi_cli_version_floor`
   runs real unsupported and supported npm Pi installations through `omnigent pi`
@@ -184,7 +196,11 @@ Cross-harness journeys:
   These own their environment: run with plain `uv run pytest`. They drive a
   real Codex TUI and REST session settings, checking the outgoing Responses
   effort, native settings, private config, and session state. Only the model
-  replies are mocked; models absent from the installed CLI are skipped.
+  replies are mocked; models absent from the installed CLI are skipped. Set
+  `OMNIGENT_TEST_CODEX_STANDARD_MODEL` (low..xhigh), `OMNIGENT_TEST_CODEX_EXTENDED_MODEL`
+  (max/ultra), and `OMNIGENT_TEST_CODEX_SWITCH_MODEL` (a different default) to
+  substitute models; a configured model the installed catalog lacks fails
+  instead of skipping, and replies stay on the local mock server.
   Existing-session cases also require the picker to show the applied effort
   when an unsupported request clamps back to the already active native value.
   Concurrent runner controls are covered by
@@ -280,6 +296,15 @@ Cross-harness journeys:
   covers the real CLI and transcript forwarder through the repro environment.
   It requires Claude Code and tmux; machine-managed Claude settings need an
   isolated container for the scripted model endpoint.
+  If shell mode or the prompt-history search still occupies Claude Code's input
+  box after Omnigent tries to dismiss it with Escape, the web message is refused
+  with a notice to open the terminal, dismiss it, and resend. No message text is
+  typed into the pane.
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_escape_cannot_clear`
+  covers the refusal with a fake tmux (plain `uv run pytest`);
+  `tests/e2e_ui/messages/test_claude_native_refused_delivery_persistence.py::test_claude_refused_message_survives_reload`
+  (own environment; a scripted stand-in for the Claude TUI and real tmux) checks
+  that the refused input is still shown after a reload.
 - **`chat-render`, Claude shell commands from the agent terminal:**
   `tests/browser_ui/chat/test_native_shell_settlement.py::test_terminal_shell_commands_keep_their_user_turns`
   replays terminal-origin records in the built SPA at desktop and phone widths.
@@ -325,7 +350,8 @@ Cross-harness journeys:
   a web message through the public bridge into a real retained dead tmux pane.
   It checks prompt budgets equal to the hard cap and early exit detection with
   longer budgets. `test_claude_native_slow_ready.py` checks successful delivery
-  after slow startup, an early crash, and the live-pane timeout. These tests
+  after slow startup, an early crash, the live-pane timeout, and content-free
+  failing-operation evidence when tmux exits after readiness. These tests
   exercise the injection used by existing-session and first-message composers;
   CLI typing bypasses the web injection gate. They do not run a vendor model.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**

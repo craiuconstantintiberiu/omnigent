@@ -18,7 +18,10 @@ the header menu), and each place is a separate entry point.
 - `rename`: from the row, the header menu, or the header title; long titles are
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
-  view, which can be filtered by project and paged.
+  view, which can be filtered by project and paged. On a server with worktree
+  cleanup, archiving a session that has a git worktree first asks whether to
+  also delete the worktree (the branch is kept); Remember my choice saves the
+  answer, which Settings → Git can change later.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
@@ -30,9 +33,16 @@ the header menu), and each place is a separate entry point.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
+- `export`: Export in the header menu saves the transcript as a local file.
+- `unread`: Mark as unread re-lights a row's unread dot and Mark as read clears
+  it; the state survives a reload.
+- `project`: Add to project (Move session once filed) puts a session in a
+  project folder from the row menu, the header menu, or the header's folder tag.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
+  For a native target, the fork dialog also offers model, reasoning effort,
+  and permission mode pickers.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
   or discovered from an existing session), as well as to a built-in agent; the
   fork uses the chosen agent.
@@ -84,7 +94,8 @@ the header menu), and each place is a separate entry point.
 ## How to get to it (user POV)
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
-offer pin, fork, rename, archive or unarchive, and delete.
+offer pin, fork, rename, mark as unread or read, add to project (or move
+session), archive or unarchive, and delete.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -94,15 +105,25 @@ that slot.
 actions (archive, unarchive, delete).
 
 **Session header menu:** open a session and use the menu next to its title for
-pin, fork, rename, archive or unarchive, and delete. Clicking the title also
-renames. Sub-agent sessions hide owner-only actions.
+pin, fork, export, rename, mark as unread, add to project, archive or
+unarchive, and delete. Clicking the title also renames, and the title's folder
+tag also moves the session into a project. Sub-agent sessions hide owner-only
+actions.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
-dialog, keep the agent or choose another built-in or custom agent. Your custom
+dialog, keep the agent or choose another built-in or custom agent; for a
+native target, the dialog also shows model, reasoning effort, and permission
+mode pickers. Your custom
 agents (installed with `omnigent agent add`, imported in the Create custom agent
 dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
+
+**Archive worktree prompt:** archive a worktree session from the row menu,
+bulk selection, or header menu; the "Also delete the worktree?" dialog offers
+"No, archive only" and "Yes, delete worktree", plus Remember my choice.
+Dismissing it cancels the archive. Settings → Git → Worktrees holds the saved
+choice only when the server supports cleanup.
 
 **Archived view:** choose Display → Archived sessions in the sidebar filter
 menu, then filter by project.
@@ -246,6 +267,17 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_load_more_pages_through`
+- **`archive`, worktree prompt:**
+  `tests/server/integration/test_sessions_archive.py::test_archive_stop_removes_worktree_when_requested`
+  and
+  `tests/server/integration/test_sessions_archive.py::test_delete_worktree_requires_archive`
+  (plain `uv run pytest`) cover the opt-in teardown that keeps the branch and
+  the rejected request without archive. The prompt, remembered choice, and the
+  archive-only fallback on a server without cleanup have component coverage in
+  `web/src/shell/Sidebar.archive.test.tsx` and
+  `web/src/shell/HeaderConversationMenu.test.tsx`. Manually: archive a
+  worktree session from the row menu, bulk selection, and header menu, and
+  expect the dialog each time; a session without a worktree archives silently.
 - **`unarchive`, header menu:**
   `tests/e2e_ui/sessions/test_archived_session_header_menu.py::test_archived_session_header_menu_offers_unarchive`.
   The sidebar row and bulk unarchive have web unit coverage only: archive a
@@ -258,6 +290,19 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`delete`:**
   `tests/e2e_ui/sessions/test_sidebar_delete.py::test_delete_session_removes_row_and_from_store`,
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`
+- **`export`, header menu (own environment):**
+  `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_session_menu_offers_export`,
+  `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_export_downloads_transcript`
+  seed the transcript into the spawned server's database.
+- **`unread`, sidebar row:**
+  `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_mark_unread_lights_the_dot_and_persists_across_reload`.
+  Repeat from the header menu by hand and expect the row's unread dot.
+- **`project`, sidebar row and header folder tag:**
+  `tests/e2e_ui/sessions/test_move_to_project.py::test_move_session_into_project_regroups_sidebar_row`
+  and, seeding its own environment,
+  `tests/e2e_ui/sessions/test_header_move_to_project.py::test_header_folder_tag_moves_session_into_existing_project`.
+  Repeat from the header menu's Add to project by hand and expect the row to
+  regroup under that project.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
 - **`fork`, message cutoff:**
@@ -282,6 +327,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`fork`, whole session and resources:**
   `tests/e2e_ui/fork_session/test_fork_preserves_image_attachment.py::test_fork_carries_image_reference_and_its_resource`.
   This uses the header menu and checks that the fork's image URL loads.
+  The dialog's permission-mode picker for native targets has component
+  coverage in `web/src/shell/ForkSessionDialog.test.tsx`; drive the model and
+  effort pickers by hand: fork a Codex session, pick another effort, and expect
+  the new session's pill to show it.
   Duration coverage:
   `tests/e2e_ui/fork_session/test_fork_retains_worked_for.py::test_fork_retains_worked_for_duration`,
   and transcript-copy integration coverage (plain `uv run pytest`):
@@ -538,6 +587,9 @@ plain `uv run pytest`, which starts a private server for the test.
   that the undo toast restores the session.
 - The header menu of an archived session must offer Unarchive, not Archive.
   Open an archived session directly to see it.
+- The worktree prompt appears only when the server advertises worktree cleanup
+  and the session has a worktree. A remembered answer skips it on every later
+  archive; reset the choice in Settings → Git before re-testing.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
