@@ -10441,13 +10441,18 @@ class _EditableComposer:
 
     _RULE = "──────────────────────────────"
 
-    def __init__(self, draft: str, *, cursor: int) -> None:
+    def __init__(self, draft: str, *, cursor: int, visible_rows: int | None = None) -> None:
         """
         :param draft: Text the person left in the box.
         :param cursor: Cursor offset into *draft*.
+        :param visible_rows: When set, the pane is a sliver with room for the
+            box's opening rule and this many rows only, so the closing rule
+            never comes on screen (the ``_SLIVER_MULTILINE_DRAFT_PANE``
+            geometry). ``None`` shows the whole box.
         """
         self.text = draft
         self.cursor = cursor
+        self._visible_rows = visible_rows
         self.submitted: list[str] = []
         self._paste_buffer = ""
         self._actions = {
@@ -10484,8 +10489,11 @@ class _EditableComposer:
     def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
         del socket_path, tmux_target
         first, *rest = self.text.split("\n")
-        rows = "\n".join([f"❯ {first}", *(f"  {row}" for row in rest)])
-        return f"{self._RULE}\n{rows}\n{self._RULE}\n  ? for shortcuts\n"
+        rows = [f"❯ {first}", *(f"  {row}" for row in rest)]
+        if self._visible_rows is not None:
+            clipped = "\n".join(rows[: self._visible_rows])
+            return f"⏺ done\n{self._RULE}\n{clipped}\n"
+        return f"{self._RULE}\n" + "\n".join(rows) + f"\n{self._RULE}\n  ? for shortcuts\n"
 
     def _insert(self, text: str) -> None:
         self.text = self.text[: self.cursor] + text + self.text[self.cursor :]
@@ -10513,20 +10521,40 @@ class _EditableComposer:
 
 _STALE_MULTILINE_DRAFT = "STALE ONE\nSTALE TWO\nSTALE THREE"
 
+# The guarantee holds for any cursor position: before the draft's first
+# character, inside its middle line, and after its last character.
+_STALE_DRAFT_CURSORS = pytest.mark.parametrize(
+    "cursor",
+    [0, len("STALE ONE\nSTA"), len(_STALE_MULTILINE_DRAFT)],
+    ids=["cursor-at-start", "cursor-mid-draft", "cursor-at-end"],
+)
+# ``None`` shows the whole box. ``1`` is a sliver pane with room for the
+# opening rule and one row only, so a capture cannot tell a one-line draft
+# from the first line of a longer one.
+_BOX_GEOMETRIES = pytest.mark.parametrize(
+    "visible_rows", [None, 1], ids=["whole-box-on-screen", "sliver-pane"]
+)
 
+
+@_BOX_GEOMETRIES
+@_STALE_DRAFT_CURSORS
 def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cursor: int,
+    visible_rows: int | None,
 ) -> None:
     """
     A multi-line draft left in the box is not submitted with the message.
 
     Clearing only the cursor's line leaves the draft's other lines in the
     box, and the paste then lands among them, so Enter would send the
-    person's half-written draft as part of the web message.
+    person's half-written draft as part of the web message. In a sliver
+    pane the capture shows one row of the draft, so stopping after one
+    clearing burst would likewise leave the hidden lines to be submitted.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=3)
+    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=cursor, visible_rows=visible_rows)
     composer.install(monkeypatch)
 
     inject_user_message(bridge_dir, content="hello from the web")
@@ -10534,19 +10562,24 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     assert [text.strip() for text in composer.submitted] == ["hello from the web"]
 
 
+@_BOX_GEOMETRIES
+@_STALE_DRAFT_CURSORS
 def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cursor: int,
+    visible_rows: int | None,
 ) -> None:
     """
     A multi-line draft left in the box is not submitted with a slash command.
 
     Otherwise the command becomes a line of the draft and Enter sends the
     draft plus ``/effort high`` to the model as a prompt instead of
-    applying the setting.
+    applying the setting. The sliver-pane case guards the same hidden lines
+    as for a message.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=3)
+    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=cursor, visible_rows=visible_rows)
     composer.install(monkeypatch)
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -10555,23 +10588,26 @@ def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
 
 
 @pytest.mark.parametrize(
-    ("pane", "rows"),
+    ("pane", "box"),
     [
         (
             "──────\n❯ one\n  two\n\n  four\n──────\n  ? for shortcuts\n",
-            ["❯ one", "  two", "", "  four"],
+            claude_native_bridge._ComposerBox(["❯ one", "  two", "", "  four"], framed=True),
         ),
-        ("scrollback\n──────\n❯ one\n  two\n  three", ["❯ one", "  two", "  three"]),
+        (
+            "scrollback\n──────\n❯ one\n  two\n  three",
+            claude_native_bridge._ComposerBox(["❯ one", "  two", "  three"], framed=False),
+        ),
         ("──────\n  Change effort level?\n  ❯ 1. Yes, switch to low\n    2. No, go back\n", None),
         ("plain output, no box\n", None),
     ],
     ids=["framed-with-blank-row", "closing-rule-off-screen", "dialog-selector", "no-box"],
 )
-def test_composer_box_rows_reads_every_row_of_the_input_box(
-    pane: str, rows: list[str] | None
+def test_composer_box_reads_every_row_of_the_input_box(
+    pane: str, box: claude_native_bridge._ComposerBox | None
 ) -> None:
-    """Every row of the live box counts, including a draft's blank lines."""
-    assert claude_native_bridge._composer_box_rows(pane) == rows
+    """Every row of the live box counts, and a box cut off by the pane says so."""
+    assert claude_native_bridge._composer_box(pane) == box
 
 
 def test_a_model_switch_types_the_argument_form_and_confirms(

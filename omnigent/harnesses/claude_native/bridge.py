@@ -308,8 +308,9 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # rather than as text when they arrive in one burst.
 _COMPOSER_KILL_TO_LINE_END = "\x1b[107;5u"
 _COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
-# Rounds of clearing for a draft taller than the pane, which shows only some
-# of its rows at a time.
+# Rounds of clearing for a draft the pane cannot show whole: a draft taller
+# than the pane shows only some of its rows at a time, and a sliver-height
+# pane never has room for the box's closing rule at all.
 _COMPOSER_CLEAR_MAX_ROUNDS = 3
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
@@ -5896,19 +5897,31 @@ def _composer_row(pane: str) -> str | None:
     return None
 
 
-def _composer_box_rows(pane: str) -> list[str] | None:
+class _ComposerBox(NamedTuple):
+    """Claude Code's live input box as a pane capture showed it."""
+
+    #: The box's rows, e.g. ``["❯ fix the bug", "  in foo.py"]``. Blank rows
+    #: are kept, since a draft's empty lines are lines too.
+    rows: list[str]
+    #: Whether the closing rule was on screen. Only then is ``rows`` the whole
+    #: draft; otherwise the pane ran out of room and the draft may go on below.
+    framed: bool
+
+
+def _composer_box(pane: str) -> _ComposerBox | None:
     """
-    Return every row of Claude Code's live input box, or ``None``.
+    Return every visible row of Claude Code's live input box, or ``None``.
 
     The box is located as in :func:`_composer_row`: its first row sits
     directly under the opening rule, led by a composer glyph. The rows run to
     the closing rule, or to the bottom of the pane when a draft taller than
-    the pane pushes the closing rule off screen. Blank rows are kept, since a
-    draft's empty lines are lines too.
+    the pane, or a sliver-height pane, pushes the closing rule off screen;
+    the result says which, since a cut-off box may hold rows the capture
+    did not show.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: The box's rows, e.g. ``["❯ fix the bug", "  in foo.py"]``, or
-        ``None`` when no input box is on screen.
+    :returns: The box's visible rows and whether its closing rule was on
+        screen, or ``None`` when no input box is on screen.
     """
     lines = pane.splitlines()
     rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
@@ -5917,10 +5930,10 @@ def _composer_box_rows(pane: str) -> list[str] | None:
     if len(rules) >= 2:
         first = rules[-2] + 1
         if first < rules[-1] and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
-            return lines[first : rules[-1]]
+            return _ComposerBox(lines[first : rules[-1]], framed=True)
     first = rules[-1] + 1
     if first < len(lines) and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
-        return lines[first:]
+        return _ComposerBox(lines[first:], framed=False)
     return None
 
 
@@ -5933,21 +5946,31 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     per row of the box therefore empty a draft from any cursor position,
     while presses beyond the draft do nothing. Clearing only the cursor's
     line would leave the rest of a multi-line draft to be submitted with the
-    next message. When the box shows more than one row afterwards (a draft
-    taller than the pane), it is cleared again.
+    next message.
+
+    One burst is known to have emptied the box only when the capture showed
+    the box whole (closing rule on screen) with a single row. A box with
+    more rows, or one cut off by the bottom of the pane (a draft taller than
+    the pane, or a sliver-height pane that never has room for the closing
+    rule), may still hold lines the capture did not show, so it is cleared
+    again, up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds in all.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
     for _ in range(_COMPOSER_CLEAR_MAX_ROUNDS):
-        rows = _composer_box_rows(_capture_pane(socket_path, tmux_target))
-        presses = 2 * len(rows) if rows else 2
+        box = _composer_box(_capture_pane(socket_path, tmux_target))
+        presses = 2 * len(box.rows) if box is not None else 2
         keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
         _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
-        if rows is None or len(rows) <= 1:
+        if box is None or (box.framed and len(box.rows) <= 1):
             return
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    _logger.debug(
+        "Composer clear spent its %d rounds without a capture showing the box whole and empty",
+        _COMPOSER_CLEAR_MAX_ROUNDS,
+    )
 
 
 def _claude_prompt_rendered(pane: str) -> bool:
