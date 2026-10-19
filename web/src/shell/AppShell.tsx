@@ -100,7 +100,7 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
-import { isTempConvId, useChatStore } from "@/store/chatStore";
+import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
 import { supportsSideChat } from "@/lib/sideChat";
 import {
   STARTING_GRACE_S,
@@ -1050,6 +1050,8 @@ export function AppShell() {
             chat.sessionStatus,
             chat.queuedMessages,
             readAlwaysSteer(),
+            false,
+            holdsInitialDraft(chat),
           )
         ) {
           chat.enqueueMessage(text, files);
@@ -2175,6 +2177,10 @@ export function AppShell() {
   // the failed-suppression exactly like an in-flight send does.
   const launchPending =
     runnerLaunchedAt !== null && Date.now() - runnerLaunchedAt < STARTING_GRACE_S * 1000;
+  // A managed sandbox can take minutes to come up, past every grace here; until
+  // `ready` its session has no runner, so only the launch status says it is coming.
+  const sandboxStatus = useChatStore((s) => s.sandboxStatus);
+  const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
   // Until the liveness row or session snapshot hydrates, a brand-new
   // session is indistinguishable from a stopped one — treat the unobserved
   // window as starting so the stopped UI can't flash during startup.
@@ -2206,6 +2212,7 @@ export function AppShell() {
     (sessionStatus !== "failed" || chatStatus === "streaming" || launchPending) &&
     (livenessRowPending ||
       launchPending ||
+      sandboxLaunching ||
       // terminal_pending is the runner's own "creating the PTY" signal,
       // accurate in the snapshot after a reload; gate on an alive-ish
       // liveness so a stale flag from a dead runner can't pin the spinner.
